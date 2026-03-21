@@ -384,8 +384,11 @@ class AlbumentationsWrapper:
                 bbox_params=A.BboxParams(
                     format="pascal_voc",  # Boxes are in (x1, y1, x2, y2) format
                     label_fields=["category_ids", "idxs"],  # Track labels and indices for per-instance field sync
-                    min_visibility=0.0,  # Remove boxes with zero visibility/area after transformation
+                    min_visibility=0.1,  # Remove boxes with zero visibility/area after transformation
+					min_width=2.0,
+                    min_height=2.0,
                     clip=True,  # Clip box coordinates to image boundaries after transformation
+                    filter_invalid_bboxes=True,
                 ),
             )
         else:
