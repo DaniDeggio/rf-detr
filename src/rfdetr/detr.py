@@ -47,6 +47,7 @@ from rfdetr.config import (
 from rfdetr.datasets.coco import is_valid_coco_dataset
 from rfdetr.datasets.yolo import is_valid_yolo_dataset
 from rfdetr.models import PostProcess, build_model
+from rfdetr.export.postprocessed_export import PostprocessedExportModule
 from rfdetr.utilities.logger import get_logger
 from rfdetr.utilities.state_dict import validate_checkpoint_compatibility
 
@@ -372,6 +373,8 @@ class RFDETR:
         force: bool = False,
         shape: tuple = None,
         batch_size: int = 1,
+        postprocess: bool = False,
+        output_mask: bool = True,
         **kwargs,
     ) -> None:
         """Export the trained model to ONNX format.
@@ -417,6 +420,9 @@ class RFDETR:
         input_names = ["input"]
         if backbone_only:
             output_names = ["features"]
+        elif postprocess:
+            # when requesting postprocess ONNX, include scores and masks in outputs
+            output_names = ["dets", "labels", "scores", "masks"]
         elif self.model_config.segmentation_head:
             output_names = ["dets", "labels", "masks"]
         else:
@@ -449,9 +455,17 @@ class RFDETR:
         model.cpu()
         input_tensors = input_tensors.cpu()
 
+        # If postprocess requested, wrap the underlying nn.Module so ONNX returns
+        # fixed tensors (boxes, labels, scores, masks) already post-processed.
+        export_model = model
+        if postprocess:
+            # model here is the nn.Module instance (deepcopied); build PostprocessedExportModule
+            postproc = self.model.postprocess if hasattr(self.model, "postprocess") else PostProcess(num_select=self.model.args.num_select)
+            export_model = PostprocessedExportModule(model, postproc, output_mask=output_mask, shape=shape)
+
         output_file = export_onnx(
             output_dir=str(output_dir_path),
-            model=model,
+            model=export_model,
             input_names=input_names,
             input_tensors=input_tensors,
             output_names=output_names,
