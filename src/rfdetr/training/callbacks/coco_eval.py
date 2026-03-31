@@ -4,7 +4,7 @@
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 
-"""COCOEvalCallback — torchmetrics-based mAP and F1 evaluation (Phase 3)."""
+"""COCOEvalCallback — torchmetrics-based mAP and F1 evaluation."""
 
 import contextlib
 from typing import Any
@@ -146,7 +146,7 @@ class COCOEvalCallback(Callback):
         """Accumulate predictions and matching data for one validation batch.
 
         Expects ``outputs`` to be the dict returned by
-        ``RFDETRModule.validation_step``:
+        ``RFDETRModelModule.validation_step``:
         ``{"results": list[dict], "targets": list[dict]}``.
 
         When an EMA callback is present the EMA model is run on the same batch
@@ -281,8 +281,8 @@ class COCOEvalCallback(Callback):
             f"mAR @{self._max_dets}": float(metrics[mar_key]),
         }
 
-        pl_module.log(f"{split}/mAP_50_95", metrics[f"{pfx}map"])
-        pl_module.log(f"{split}/mAP_50", metrics[f"{pfx}map_50"])
+        pl_module.log(f"{split}/mAP_50_95", metrics[f"{pfx}map"], prog_bar=True)
+        pl_module.log(f"{split}/mAP_50", metrics[f"{pfx}map_50"], prog_bar=True)
         pl_module.log(f"{split}/mAP_75", metrics[f"{pfx}map_75"])
         pl_module.log(f"{split}/mAR", metrics[mar_key])
 
@@ -300,7 +300,7 @@ class COCOEvalCallback(Callback):
         if self.map_metric_ema is not None:
             ema_metrics = self.map_metric_ema.compute()
             ema_mar_key = f"{pfx}mar_{self._max_dets}"
-            pl_module.log(f"{split}/ema_mAP_50_95", ema_metrics[f"{pfx}map"])
+            pl_module.log(f"{split}/ema_mAP_50_95", ema_metrics[f"{pfx}map"], prog_bar=True)
             pl_module.log(f"{split}/ema_mAP_50", ema_metrics[f"{pfx}map_50"])
             pl_module.log(f"{split}/ema_mAR", ema_metrics[ema_mar_key])
             trainer.callback_metrics[f"{split}/ema_mAP_50_95"] = ema_metrics[f"{pfx}map"].detach().cpu()
@@ -335,7 +335,7 @@ class COCOEvalCallback(Callback):
             overall["F1"] = float(best["macro_f1"])
             overall["Precision"] = float(best["macro_precision"])
             overall["Recall"] = float(best["macro_recall"])
-            pl_module.log(f"{split}/F1", float(best["macro_f1"]))
+            pl_module.log(f"{split}/F1", float(best["macro_f1"]), prog_bar=True)
             pl_module.log(f"{split}/precision", float(best["macro_precision"]))
             pl_module.log(f"{split}/recall", float(best["macro_recall"]))
             trainer.callback_metrics[f"{split}/F1"] = torch.tensor(float(best["macro_f1"]))
@@ -351,7 +351,7 @@ class COCOEvalCallback(Callback):
             overall["F1"] = 0.0
             overall["Precision"] = 0.0
             overall["Recall"] = 0.0
-            pl_module.log(f"{split}/F1", 0.0)
+            pl_module.log(f"{split}/F1", 0.0, prog_bar=True)
             pl_module.log(f"{split}/precision", 0.0)
             pl_module.log(f"{split}/recall", 0.0)
             trainer.callback_metrics[f"{split}/F1"] = torch.tensor(0.0)
@@ -693,10 +693,10 @@ class COCOEvalCallback(Callback):
         ``engine.build_matching_data`` expect ``[K, H, W]``, so squeeze the
         channel dim when present.
 
-        TODO(post-migration): audit whether ``PostProcess.forward`` should
-        drop the channel dim itself (returning ``[K, H, W]`` directly), or
-        whether other callers (e.g. ``RFDETR.predict``) rely on the 4-D shape
-        and handle ``.squeeze(1)`` themselves.  See regression fix — Bug 4.
+        ``PostProcess.forward`` currently returns ``[K, 1, H, W]`` masks.
+        Keep this callback-local squeeze for metric code paths because
+        ``RFDETR.predict`` and other inference-facing callers still consume the
+        4-D representation and apply ``.squeeze(1)`` at their boundary.
 
         Args:
             preds: Raw per-image prediction dicts from ``PostProcess``.

@@ -4,37 +4,32 @@
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 
-"""LightningModule for RF-DETR training and validation (Phase 1)."""
+"""LightningModule for RF-DETR training and validation."""
 
 from __future__ import annotations
 
 import math
-import os
 import random
+import warnings
 from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
 from pytorch_lightning import LightningModule, seed_everything
 
-from rfdetr._namespace import build_namespace
-from rfdetr.assets.model_weights import download_pretrain_weights, validate_pretrain_weights
+from rfdetr._namespace import _namespace_from_configs
 from rfdetr.config import ModelConfig, TrainConfig
 from rfdetr.datasets.coco import compute_multi_scale_scales
-from rfdetr.models.lwdetr import build_criterion_and_postprocessors, build_model
+from rfdetr.models import build_criterion_from_config, build_model_from_config
+from rfdetr.models.weights import apply_lora, load_pretrain_weights
 from rfdetr.training.param_groups import get_param_dict
 from rfdetr.utilities.logger import get_logger
-from rfdetr.utilities.state_dict import validate_checkpoint_compatibility
 
 logger = get_logger()
 
 
-class RFDETRModule(LightningModule):
+class RFDETRModelModule(LightningModule):
     """LightningModule wrapping the RF-DETR model and training loop.
-
-    Migrates ``Model.__init__``, ``train_one_epoch``, ``evaluate``, and
-    optimizer setup from ``main.py`` / ``engine.py`` into PTL lifecycle hooks.
-    Coexists with the existing code until Chapter 4 removes the legacy path.
 
     Args:
         model_config: Architecture configuration.
@@ -45,17 +40,30 @@ class RFDETRModule(LightningModule):
         super().__init__()
         self.model_config = model_config
         self.train_config = train_config
-
-        # TODO(Chapter 6): remove _args; read from model_config / train_config directly.
-        self._args = self._build_args()
+        # Allow partial state-dict loading when resuming from a .pth checkpoint
+        # (which contains only model weights, not criterion/postprocess state).
+        self.strict_loading = False
 
         # Model, criterion, and postprocessor.
-        self.model = build_model(self._args)
-        if self._args.pretrain_weights is not None:
-            self._load_pretrain_weights()
-        if self._args.backbone_lora:
-            self._apply_lora()
-        self.criterion, self.postprocess = build_criterion_and_postprocessors(self._args)
+        self.model = build_model_from_config(model_config, train_config)
+        if model_config.pretrain_weights is not None:
+            # Capture the configured class count before loading weights so we can
+            # detect any automatic alignment to the checkpoint.
+            prev_num_classes = self.model_config.num_classes
+            load_pretrain_weights(self.model, self.model_config)
+            # If the loaded checkpoint changed the model's effective number of
+            # classes (e.g. to match a fine-tuned head), persist that back onto
+            # the model_config so downstream components see the aligned value.
+            if hasattr(self.model, "num_classes"):
+                model_num_classes = getattr(self.model, "num_classes")
+                if model_num_classes is not None and model_num_classes != prev_num_classes:
+                    self.model_config.num_classes = model_num_classes
+        if model_config.backbone_lora:
+            apply_lora(self.model)
+
+        # Build criterion and postprocessor after potential num_classes
+        # alignment so they match the current model head.
+        self.criterion, self.postprocess = build_criterion_from_config(self.model_config, self.train_config)
 
         # torch.compile is opt-in: set model_config.compile=True to enable.
         # Only enabled on CUDA; MPS and CPU do not benefit from compilation.
@@ -75,97 +83,6 @@ class RFDETRModule(LightningModule):
             torch._dynamo.config.suppress_errors = True
             torch._dynamo.config.capture_scalar_outputs = True
             self.model = torch.compile(self.model, dynamic=True)
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    # TODO(Chapter 6): delete _build_args() when _args.py / populate_args() are removed.
-    def _build_args(self) -> Any:
-        """Map Pydantic configs to the legacy argparse.Namespace.
-
-        Returns:
-            Namespace compatible with ``build_model`` and
-            ``build_criterion_and_postprocessors``.
-        """
-        return build_namespace(self.model_config, self.train_config)
-
-    def _load_pretrain_weights(self) -> None:
-        """Load pretrained checkpoint into ``self.model``.
-
-        Mirrors ``Model.__init__`` checkpoint loading logic: validates hash,
-        re-downloads on corruption, trims query embeddings to match config.
-        """
-        args = self._args
-        # Download first (no-op if already present and hash is valid).
-        download_pretrain_weights(args.pretrain_weights)
-        # If the first download attempt didn't produce the file (e.g. stale MD5
-        # caused an earlier ValueError that was silently swallowed), retry with
-        # MD5 validation disabled so a stale registry hash can't block training.
-        if not os.path.isfile(args.pretrain_weights):
-            logger.warning("Pretrain weights not found after initial download; retrying without MD5 validation.")
-            download_pretrain_weights(args.pretrain_weights, redownload=True, validate_md5=False)
-        validate_pretrain_weights(args.pretrain_weights, strict=False)
-        try:
-            checkpoint = torch.load(args.pretrain_weights, map_location="cpu", weights_only=False)
-        except Exception:
-            logger.info("Failed to load pretrain weights, re-downloading")
-            download_pretrain_weights(args.pretrain_weights, redownload=True, validate_md5=False)
-            checkpoint = torch.load(args.pretrain_weights, map_location="cpu", weights_only=False)
-
-        if "args" in checkpoint and hasattr(checkpoint["args"], "class_names"):
-            self._pretrain_class_names = checkpoint["args"].class_names
-
-        validate_checkpoint_compatibility(checkpoint, args)
-
-        checkpoint_num_classes = checkpoint["model"]["class_embed.bias"].shape[0]
-        if checkpoint_num_classes != args.num_classes + 1:
-            logger.warning(
-                "Reinitializing detection head: checkpoint has %d classes, configured for %d.",
-                checkpoint_num_classes - 1,
-                args.num_classes,
-            )
-            self.model.reinitialize_detection_head(checkpoint_num_classes)
-
-        # Trim query embeddings to the configured query count.
-        num_desired_queries = args.num_queries * args.group_detr
-        query_param_names = ["refpoint_embed.weight", "query_feat.weight"]
-        for name in list(checkpoint["model"].keys()):
-            if any(name.endswith(x) for x in query_param_names):
-                checkpoint["model"][name] = checkpoint["model"][name][:num_desired_queries]
-
-        self.model.load_state_dict(checkpoint["model"], strict=False)
-
-        # After loading checkpoint weights (which may have a different class count),
-        # trim the detection head back to the configured num_classes so that PostProcess
-        # returns labels in [0, num_classes) rather than [0, checkpoint_num_classes).
-        if checkpoint_num_classes != args.num_classes + 1:
-            self.model.reinitialize_detection_head(args.num_classes + 1)
-
-    def _apply_lora(self) -> None:
-        """Apply LoRA adapters to the backbone encoder.
-
-        Mirrors ``Model.__init__`` LoRA setup.
-        """
-        from peft import LoraConfig, get_peft_model
-
-        lora_config = LoraConfig(
-            r=16,
-            lora_alpha=16,
-            use_dora=True,
-            target_modules=[
-                "q_proj",
-                "v_proj",
-                "k_proj",
-                "qkv",
-                "query",
-                "key",
-                "value",
-                "cls_token",
-                "register_tokens",
-            ],
-        )
-        self.model.backbone[0].encoder = get_peft_model(self.model.backbone[0].encoder, lora_config)
 
     # ------------------------------------------------------------------
     # PTL lifecycle hooks
@@ -190,13 +107,12 @@ class RFDETRModule(LightningModule):
             batch: Tuple of (NestedTensor samples, list of target dicts).
             batch_idx: Index of the current batch within the epoch.
         """
-        args = self._args
+        tc = self.train_config
+        mc = self.model_config
 
-        if args.multi_scale and not args.do_random_resize_via_padding:
+        if tc.multi_scale and not tc.do_random_resize_via_padding:
             samples, _ = batch
-            scales = compute_multi_scale_scales(
-                args.resolution, args.expanded_scales, args.patch_size, args.num_windows
-            )
+            scales = compute_multi_scale_scales(mc.resolution, tc.expanded_scales, mc.patch_size, mc.num_windows)
             step = self.trainer.global_step
             random.seed(step)
             scale = random.choice(scales)
@@ -205,31 +121,6 @@ class RFDETRModule(LightningModule):
                 samples.mask = (
                     F.interpolate(samples.mask.unsqueeze(1).float(), size=scale, mode="nearest").squeeze(1).bool()
                 )
-
-    def transfer_batch_to_device(
-        self,
-        batch: Tuple,
-        device: torch.device,
-        dataloader_idx: int,
-    ) -> Tuple:
-        """Override PTL's default to handle ``NestedTensor`` device transfer.
-
-        PTL's default iterates tuple elements and calls ``.to(device)``; that
-        works for plain tensors but ``NestedTensor`` must be moved explicitly.
-
-        Args:
-            batch: Tuple of (NestedTensor samples, list of target dicts).
-            device: Target device.
-            dataloader_idx: Index of the dataloader providing this batch.
-
-        Returns:
-            Batch with all tensors on ``device``.
-        """
-        samples, targets = batch
-        non_blocking = device.type == "cuda"
-        samples = samples.to(device, non_blocking=non_blocking)
-        targets = [{k: v.to(device, non_blocking=non_blocking) for k, v in t.items()} for t in targets]
-        return samples, targets
 
     def training_step(self, batch: Tuple, batch_idx: int) -> torch.Tensor:
         """Compute loss for one training step and log metrics.
@@ -290,7 +181,6 @@ class RFDETRModule(LightningModule):
             base_lr = group_lrs[0]
             min_lr = min(group_lrs)
             max_lr = max(group_lrs)
-            # Keep LR visible in the live progress bar every step.
             self.log("train/lr", base_lr, prog_bar=True, on_step=True, on_epoch=False)
             self.log("train/lr_min", min_lr, prog_bar=True, on_step=True, on_epoch=False)
             self.log("train/lr_max", max_lr, prog_bar=True, on_step=True, on_epoch=False)
@@ -315,7 +205,7 @@ class RFDETRModule(LightningModule):
             loss_dict = self.criterion(outputs, targets)
             weight_dict = self.criterion.weight_dict
             loss = sum(loss_dict[k] * weight_dict[k] for k in loss_dict if k in weight_dict)
-            self.log("val/loss", loss, sync_dist=True, batch_size=len(targets))
+            self.log("val/loss", loss, prog_bar=True, on_epoch=True, sync_dist=True, batch_size=len(targets))
 
         orig_sizes = torch.stack([t["orig_size"] for t in targets])
         results = self.postprocess(outputs, orig_sizes)
@@ -331,14 +221,14 @@ class RFDETRModule(LightningModule):
         Returns:
             PTL optimizer config dict with optimizer and step-interval scheduler.
         """
-        args = self._args
         tc = self.train_config
+        ns = _namespace_from_configs(self.model_config, tc)
 
         # Unwrap torch.compile's OptimizedModule so get_param_dict sees the
         # original module's named_parameters() — compiled wrapper can cause
         # name-prefix mismatches that put the same tensor in multiple groups.
         model_for_params = getattr(self.model, "_orig_mod", self.model)
-        param_dicts = get_param_dict(args, model_for_params)
+        param_dicts = get_param_dict(ns, model_for_params)
         param_dicts = [p for p in param_dicts if p["params"].requires_grad]
         use_fused = self.model_config.fused_optimizer and torch.cuda.is_available() and torch.cuda.is_bf16_supported()
         optimizer = torch.optim.AdamW(
@@ -470,11 +360,17 @@ class RFDETRModule(LightningModule):
         if "model" in checkpoint and "state_dict" not in checkpoint:
             checkpoint["state_dict"] = {"model." + k: v for k, v in checkpoint["model"].items()}
 
-        # Stash legacy EMA weights for the EMA callback to restore if active.
-        # TODO(Chapter 6): RFDETREMACallback.on_load_checkpoint consumer not yet implemented;
-        # _pending_legacy_ema_state is intentionally unused until then.
+        # Stash legacy EMA weights for RFDETREMACallback.setup(), which restores
+        # them into AveragedModel when resuming from converted legacy checkpoints.
         if "legacy_ema_state_dict" in checkpoint:
             self._pending_legacy_ema_state = checkpoint["legacy_ema_state_dict"]
+            warnings.warn(
+                "Checkpoint contains legacy EMA weights (`legacy_ema_state_dict`). "
+                "Add RFDETREMACallback to your trainer callbacks to restore them; "
+                "without it the stashed weights will be ignored.",
+                UserWarning,
+                stacklevel=2,
+            )
 
     def reinitialize_detection_head(self, num_classes: int) -> None:
         """Reinitialize the detection head for a new class count.

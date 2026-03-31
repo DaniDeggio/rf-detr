@@ -11,6 +11,8 @@ from typing import Any
 
 import torch
 from pytorch_lightning import Trainer
+from pytorch_lightning.callbacks import ModelCheckpoint, RichProgressBar, TQDMProgressBar
+from pytorch_lightning.callbacks.progress.rich_progress import RichProgressBarTheme
 from pytorch_lightning.loggers import CSVLogger, MLFlowLogger, TensorBoardLogger, WandbLogger
 
 from rfdetr.config import ModelConfig, TrainConfig
@@ -95,6 +97,11 @@ def build_trainer(
     # --- Build callbacks ---
     callbacks = []
 
+    if tc.progress_bar == "rich":
+        callbacks.append(RichProgressBar(theme=RichProgressBarTheme(metrics_format=".3e")))
+    elif tc.progress_bar == "tqdm":
+        callbacks.append(TQDMProgressBar())
+
     if enable_ema:
         callbacks.append(
             RFDETREMACallback(
@@ -115,6 +122,34 @@ def build_trainer(
             segmentation=model_config.segmentation_head,
             eval_interval=tc.eval_interval,
             log_per_class_metrics=tc.log_per_class_metrics,
+        )
+    )
+
+    # Latest resume checkpoint — overwritten every epoch.
+    # Skip when checkpoint_interval == 1 to avoid duplicate ModelCheckpoint state_key.
+    if tc.checkpoint_interval != 1:
+        callbacks.append(
+            ModelCheckpoint(
+                dirpath=tc.output_dir,
+                filename="last",
+                every_n_epochs=1,
+                save_top_k=1,
+                enable_version_counter=False,
+                auto_insert_metric_name=False,
+                verbose=False,
+            )
+        )
+
+    # Interval archive checkpoints — kept for the full run.
+    callbacks.append(
+        ModelCheckpoint(
+            dirpath=tc.output_dir,
+            filename="checkpoint_{epoch}",
+            every_n_epochs=tc.checkpoint_interval,
+            save_top_k=-1,
+            enable_version_counter=False,
+            auto_insert_metric_name=False,
+            verbose=False,
         )
     )
 
@@ -182,13 +217,7 @@ def build_trainer(
             _logger.warning("MLflow logging disabled: %s. Install with: pip install mlflow", exc)
 
     if tc.clearml:
-        warnings.warn(
-            "ClearML logging is not supported via a native PTL logger in this version."
-            " Metrics will not be logged to ClearML. Use the ClearML SDK callback directly"
-            " or wait for a dedicated ClearML PTL logger integration.",
-            UserWarning,
-            stacklevel=2,
-        )
+        raise NotImplementedError("ClearML logging is not yet supported. Remove clearml=True from TrainConfig.")
 
     # --- Promoted config fields (T4-2 added these to TrainConfig) ---
     clip_max_norm: float = tc.clip_max_norm
@@ -206,7 +235,7 @@ def build_trainer(
         "sync_batchnorm": sync_bn,
         "callbacks": callbacks,
         "logger": loggers if loggers else False,
-        "enable_progress_bar": tc.progress_bar,
+        "enable_progress_bar": tc.progress_bar is not None,
         "default_root_dir": tc.output_dir,
         "log_every_n_steps": 50,
         "deterministic": False,

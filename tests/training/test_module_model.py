@@ -4,7 +4,7 @@
 # Licensed under the Apache License, Version 2.0 [see LICENSE for details]
 # ------------------------------------------------------------------------
 
-"""Comprehensive unit tests for RFDETRModule (LightningModule wrapper)."""
+"""Comprehensive unit tests for RFDETRModelModule (LightningModule wrapper)."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock, patch
@@ -14,6 +14,7 @@ import torch
 from torch import nn
 
 from rfdetr.config import RFDETRBaseConfig, TrainConfig
+from rfdetr.models.weights import apply_lora, load_pretrain_weights
 from rfdetr.utilities.tensors import NestedTensor
 
 # ---------------------------------------------------------------------------
@@ -81,21 +82,22 @@ def _fake_postprocess():
 
 
 def _build_module(model_config=None, train_config=None, tmp_path=None):
-    """Construct RFDETRModule with build_model and build_criterion_and_postprocessors mocked."""
+    """Construct RFDETRModelModule with build_model_from_config and build_criterion_from_config mocked."""
     mc = model_config or _base_model_config()
     tc = train_config or _base_train_config(tmp_path)
     fake_model = _fake_model()
     fake_criterion = _fake_criterion()
     fake_postprocess = _fake_postprocess()
     with (
-        patch("rfdetr.training.module.build_model", return_value=fake_model),
+        patch("rfdetr.training.module_model.build_model_from_config", return_value=fake_model),
         patch(
-            "rfdetr.training.module.build_criterion_and_postprocessors", return_value=(fake_criterion, fake_postprocess)
+            "rfdetr.training.module_model.build_criterion_from_config",
+            return_value=(fake_criterion, fake_postprocess),
         ),
     ):
-        from rfdetr.training.module import RFDETRModule
+        from rfdetr.training.module_model import RFDETRModelModule
 
-        module = RFDETRModule(mc, tc)
+        module = RFDETRModelModule(mc, tc)
     return module, fake_model, fake_criterion, fake_postprocess
 
 
@@ -140,7 +142,7 @@ def make_batch():
 
 
 class TestInit:
-    """Tests for RFDETRModule.__init__ — covers attribute assignment and
+    """Tests for RFDETRModelModule.__init__ — covers attribute assignment and
     delegation to build_model() / build_criterion_and_postprocessors()
     when pretrain_weights is None."""
 
@@ -173,7 +175,7 @@ class TestInit:
         tc = _base_train_config(tmp_path, multi_scale=True)
         with (
             patch("torch.cuda.is_available", return_value=True),
-            patch("rfdetr.training.module.torch.compile") as mock_compile,
+            patch("rfdetr.training.module_model.torch.compile") as mock_compile,
         ):
             _build_module(model_config=mc, train_config=tc, tmp_path=tmp_path)
         mock_compile.assert_not_called()
@@ -184,7 +186,7 @@ class TestInit:
         tc = _base_train_config(tmp_path, multi_scale=False)
         with (
             patch("torch.cuda.is_available", return_value=True),
-            patch("rfdetr.training.module.torch.compile", side_effect=lambda m, **_: m) as mock_compile,
+            patch("rfdetr.training.module_model.torch.compile", side_effect=lambda m, **_: m) as mock_compile,
         ):
             _build_module(model_config=mc, train_config=tc, tmp_path=tmp_path)
         mock_compile.assert_called_once()
@@ -208,8 +210,8 @@ class TestLoadPretrainWeights:
             }
         }
 
-    @patch("rfdetr.training.module.torch.load")
-    @patch("rfdetr.training.module.validate_pretrain_weights")
+    @patch("rfdetr.models.weights.torch.load")
+    @patch("rfdetr.models.weights.validate_pretrain_weights")
     def test_loads_checkpoint_successfully(self, mock_validate, mock_torch_load, base_model_config, build_module):
         """A valid checkpoint must be validated, loaded, and applied to the model."""
         mc = base_model_config(num_classes=90)
@@ -217,14 +219,14 @@ class TestLoadPretrainWeights:
         mock_torch_load.return_value = checkpoint
 
         module, _, _, _ = build_module(model_config=mc)
-        module._args.pretrain_weights = "/fake/weights.pth"
-        module._load_pretrain_weights()
+        module.model_config = module.model_config.model_copy(update={"pretrain_weights": "/fake/weights.pth"})
+        load_pretrain_weights(module.model, module.model_config)
 
         mock_validate.assert_called_once_with("/fake/weights.pth", strict=False)
         module.model.load_state_dict.assert_called_once()
 
-    @patch("rfdetr.training.module.torch.load")
-    @patch("rfdetr.training.module.validate_pretrain_weights")
+    @patch("rfdetr.models.weights.torch.load")
+    @patch("rfdetr.models.weights.validate_pretrain_weights")
     def test_class_count_mismatch_triggers_reinitialize(
         self, mock_validate, mock_torch_load, base_model_config, build_module
     ):
@@ -234,8 +236,8 @@ class TestLoadPretrainWeights:
         mock_torch_load.return_value = checkpoint
 
         module, fake_model, _, _ = build_module(model_config=mc)
-        module._args.pretrain_weights = "/fake/weights.pth"
-        module._load_pretrain_weights()
+        module.model_config = module.model_config.model_copy(update={"pretrain_weights": "/fake/weights.pth"})
+        load_pretrain_weights(module.model, module.model_config)
 
         # First call: expand to checkpoint size so load_state_dict shapes match.
         # Second call: trim back to configured num_classes + 1 (background class).
@@ -244,8 +246,8 @@ class TestLoadPretrainWeights:
         fake_model.reinitialize_detection_head.assert_has_calls([call(91), call(6)])
         assert fake_model.reinitialize_detection_head.call_count == 2
 
-    @patch("rfdetr.training.module.torch.load")
-    @patch("rfdetr.training.module.validate_pretrain_weights")
+    @patch("rfdetr.models.weights.torch.load")
+    @patch("rfdetr.models.weights.validate_pretrain_weights")
     def test_class_count_match_does_not_reinitialize(
         self, mock_validate, mock_torch_load, base_model_config, build_module
     ):
@@ -255,13 +257,13 @@ class TestLoadPretrainWeights:
         mock_torch_load.return_value = checkpoint
 
         module, fake_model, _, _ = build_module(model_config=mc)
-        module._args.pretrain_weights = "/fake/weights.pth"
-        module._load_pretrain_weights()
+        module.model_config = module.model_config.model_copy(update={"pretrain_weights": "/fake/weights.pth"})
+        load_pretrain_weights(module.model, module.model_config)
 
         fake_model.reinitialize_detection_head.assert_not_called()
 
-    @patch("rfdetr.training.module.torch.load")
-    @patch("rfdetr.training.module.validate_pretrain_weights")
+    @patch("rfdetr.models.weights.torch.load")
+    @patch("rfdetr.models.weights.validate_pretrain_weights")
     def test_query_embedding_trimmed_to_configured_count(
         self, mock_validate, mock_torch_load, base_model_config, build_module
     ):
@@ -269,8 +271,8 @@ class TestLoadPretrainWeights:
         mc = base_model_config(num_classes=90)
         module, _, _, _ = build_module(model_config=mc)
 
-        num_queries = module._args.num_queries
-        group_detr = module._args.group_detr
+        num_queries = getattr(module.model_config, "num_queries", 300)
+        group_detr = getattr(module.model_config, "group_detr", 13)
         desired = num_queries * group_detr
 
         large_total = desired + 500
@@ -284,15 +286,15 @@ class TestLoadPretrainWeights:
         }
         mock_torch_load.return_value = checkpoint
 
-        module._args.pretrain_weights = "/fake/weights.pth"
-        module._load_pretrain_weights()
+        module.model_config = module.model_config.model_copy(update={"pretrain_weights": "/fake/weights.pth"})
+        load_pretrain_weights(module.model, module.model_config)
 
         assert checkpoint["model"]["refpoint_embed.weight"].shape[0] == desired
         assert checkpoint["model"]["query_feat.weight"].shape[0] == desired
 
-    @patch("rfdetr.training.module.os.path.isfile", return_value=True)
-    @patch("rfdetr.training.module.download_pretrain_weights")
-    @patch("rfdetr.training.module.validate_pretrain_weights")
+    @patch("rfdetr.models.weights.os.path.isfile", return_value=True)
+    @patch("rfdetr.models.weights.download_pretrain_weights")
+    @patch("rfdetr.models.weights.validate_pretrain_weights")
     def test_redownloads_on_load_failure(
         self, mock_validate, mock_download, mock_isfile, base_model_config, build_module
     ):
@@ -300,7 +302,7 @@ class TestLoadPretrainWeights:
         mc = base_model_config(num_classes=90)
         checkpoint = self._make_checkpoint(num_classes_in_ckpt=91)
         module, _, _, _ = build_module(model_config=mc)
-        module._args.pretrain_weights = "/fake/weights.pth"
+        module.model_config = module.model_config.model_copy(update={"pretrain_weights": "/fake/weights.pth"})
 
         load_calls = [0]
 
@@ -310,8 +312,8 @@ class TestLoadPretrainWeights:
                 raise RuntimeError("corrupted file")
             return checkpoint
 
-        with patch("rfdetr.training.module.torch.load", side_effect=fake_torch_load):
-            module._load_pretrain_weights()
+        with patch("rfdetr.models.weights.torch.load", side_effect=fake_torch_load):
+            load_pretrain_weights(module.model, module.model_config)
 
         # Verify a redownload with validate_md5=False was triggered after load failure.
         redownload_calls = [c for c in mock_download.call_args_list if c.kwargs.get("redownload") is True]
@@ -319,10 +321,10 @@ class TestLoadPretrainWeights:
         assert all(c.kwargs.get("validate_md5") is False for c in redownload_calls)
         assert load_calls[0] == 2
 
-    @patch("rfdetr.training.module.os.path.isfile", return_value=False)
-    @patch("rfdetr.training.module.download_pretrain_weights")
-    @patch("rfdetr.training.module.validate_pretrain_weights")
-    @patch("rfdetr.training.module.torch.load")
+    @patch("rfdetr.models.weights.os.path.isfile", return_value=False)
+    @patch("rfdetr.models.weights.download_pretrain_weights")
+    @patch("rfdetr.models.weights.validate_pretrain_weights")
+    @patch("rfdetr.models.weights.torch.load")
     def test_download_before_load_when_weights_absent(
         self, mock_torch_load, mock_validate, mock_download, mock_isfile, base_model_config, build_module
     ):
@@ -338,34 +340,16 @@ class TestLoadPretrainWeights:
         mock_torch_load.return_value = checkpoint
 
         module, _, _, _ = build_module(model_config=mc)
-        module._args.pretrain_weights = "/content/rf-detr-base.pth"
-        module._load_pretrain_weights()
+        module.model_config = module.model_config.model_copy(update={"pretrain_weights": "/content/rf-detr-base.pth"})
+        load_pretrain_weights(module.model, module.model_config)
 
         # download_pretrain_weights must have been called at least once before any load
         assert mock_download.call_count >= 1
         first_call = mock_download.call_args_list[0]
         assert first_call.args[0] == "/content/rf-detr-base.pth"
 
-    @patch("rfdetr.training.module.torch.load")
-    @patch("rfdetr.training.module.validate_pretrain_weights")
-    def test_pretrain_class_names_stored_when_present(
-        self, mock_validate, mock_torch_load, base_model_config, build_module
-    ):
-        """Class names from checkpoint args must be saved for transfer learning use."""
-        mc = base_model_config(num_classes=90)
-        ckpt_args = SimpleNamespace(class_names=["cat", "dog"])
-        checkpoint = self._make_checkpoint(num_classes_in_ckpt=91)
-        checkpoint["args"] = ckpt_args
-        mock_torch_load.return_value = checkpoint
-
-        module, _, _, _ = build_module(model_config=mc)
-        module._args.pretrain_weights = "/fake/weights.pth"
-        module._load_pretrain_weights()
-
-        assert module._pretrain_class_names == ["cat", "dog"]
-
-    @patch("rfdetr.training.module.torch.load")
-    @patch("rfdetr.training.module.validate_pretrain_weights")
+    @patch("rfdetr.models.weights.torch.load")
+    @patch("rfdetr.models.weights.validate_pretrain_weights")
     def test_seg_checkpoint_into_detection_model_raises(
         self, mock_validate, mock_torch_load, base_model_config, build_module
     ):
@@ -377,14 +361,15 @@ class TestLoadPretrainWeights:
         mock_torch_load.return_value = checkpoint
 
         module, _, _, _ = build_module(model_config=mc)
-        module._args.pretrain_weights = "/fake/weights.pth"
-        module._args.segmentation_head = False
+        module.model_config = module.model_config.model_copy(
+            update={"pretrain_weights": "/fake/weights.pth", "segmentation_head": False}
+        )
 
         with pytest.raises(ValueError, match="segmentation head"):
-            module._load_pretrain_weights()
+            load_pretrain_weights(module.model, module.model_config)
 
-    @patch("rfdetr.training.module.torch.load")
-    @patch("rfdetr.training.module.validate_pretrain_weights")
+    @patch("rfdetr.models.weights.torch.load")
+    @patch("rfdetr.models.weights.validate_pretrain_weights")
     def test_detection_checkpoint_into_seg_model_raises(
         self, mock_validate, mock_torch_load, base_model_config, build_module
     ):
@@ -396,14 +381,15 @@ class TestLoadPretrainWeights:
         mock_torch_load.return_value = checkpoint
 
         module, _, _, _ = build_module(model_config=mc)
-        module._args.pretrain_weights = "/fake/weights.pth"
-        module._args.segmentation_head = True
+        module.model_config = module.model_config.model_copy(
+            update={"pretrain_weights": "/fake/weights.pth", "segmentation_head": True}
+        )
 
         with pytest.raises(ValueError, match="segmentation head"):
-            module._load_pretrain_weights()
+            load_pretrain_weights(module.model, module.model_config)
 
-    @patch("rfdetr.training.module.torch.load")
-    @patch("rfdetr.training.module.validate_pretrain_weights")
+    @patch("rfdetr.models.weights.torch.load")
+    @patch("rfdetr.models.weights.validate_pretrain_weights")
     def test_patch_size_mismatch_raises(self, mock_validate, mock_torch_load, base_model_config, build_module):
         """Loading a checkpoint with a different patch_size must raise ValueError."""
         mc = base_model_config(num_classes=90)
@@ -413,15 +399,15 @@ class TestLoadPretrainWeights:
         mock_torch_load.return_value = checkpoint
 
         module, _, _, _ = build_module(model_config=mc)
-        module._args.pretrain_weights = "/fake/weights.pth"
-        module._args.segmentation_head = False
-        module._args.patch_size = 16
+        module.model_config = module.model_config.model_copy(
+            update={"pretrain_weights": "/fake/weights.pth", "segmentation_head": False, "patch_size": 16}
+        )
 
         with pytest.raises(ValueError, match="patch_size"):
-            module._load_pretrain_weights()
+            load_pretrain_weights(module.model, module.model_config)
 
-    @patch("rfdetr.training.module.torch.load")
-    @patch("rfdetr.training.module.validate_pretrain_weights")
+    @patch("rfdetr.models.weights.torch.load")
+    @patch("rfdetr.models.weights.validate_pretrain_weights")
     def test_compatible_checkpoint_does_not_raise(
         self, mock_validate, mock_torch_load, base_model_config, build_module
     ):
@@ -433,12 +419,12 @@ class TestLoadPretrainWeights:
         mock_torch_load.return_value = checkpoint
 
         module, _, _, _ = build_module(model_config=mc)
-        module._args.pretrain_weights = "/fake/weights.pth"
-        module._args.segmentation_head = False
-        module._args.patch_size = 14
+        module.model_config = module.model_config.model_copy(
+            update={"pretrain_weights": "/fake/weights.pth", "segmentation_head": False, "patch_size": 14}
+        )
 
         # Should not raise.
-        module._load_pretrain_weights()
+        load_pretrain_weights(module.model, module.model_config)
 
 
 class TestApplyLora:
@@ -459,15 +445,15 @@ class TestApplyLora:
         fake_model.backbone.__getitem__ = MagicMock(return_value=fake_backbone_0)
 
         with (
-            patch("rfdetr.training.module.build_model", return_value=fake_model),
+            patch("rfdetr.training.module_model.build_model_from_config", return_value=fake_model),
             patch(
-                "rfdetr.training.module.build_criterion_and_postprocessors",
+                "rfdetr.training.module_model.build_criterion_from_config",
                 return_value=(_fake_criterion(), _fake_postprocess()),
             ),
         ):
-            from rfdetr.training.module import RFDETRModule
+            from rfdetr.training.module_model import RFDETRModelModule
 
-            module = RFDETRModule(mc, tc)
+            module = RFDETRModelModule(mc, tc)
 
         return module, fake_model, fake_backbone_0, fake_encoder
 
@@ -478,7 +464,7 @@ class TestApplyLora:
         module, _, _, _ = self._build_module_with_backbone(tmp_path)
         mock_get_peft.return_value = MagicMock()
 
-        module._apply_lora()
+        apply_lora(module.model)
 
         mock_lora_cfg_class.assert_called_once()
         target_modules = mock_lora_cfg_class.call_args.kwargs.get("target_modules")
@@ -493,7 +479,7 @@ class TestApplyLora:
         peft_wrapped = MagicMock()
         mock_get_peft.return_value = peft_wrapped
 
-        module._apply_lora()
+        apply_lora(module.model)
 
         assert mock_get_peft.call_args[0][0] is fake_encoder
         assert fake_backbone_0.encoder is peft_wrapped
@@ -502,7 +488,7 @@ class TestApplyLora:
 class TestOnFitStart:
     """Tests for on_fit_start() seeding behavior."""
 
-    @patch("rfdetr.training.module.seed_everything")
+    @patch("rfdetr.training.module_model.seed_everything")
     def test_seed_at_rank_zero(self, mock_seed, base_train_config, build_module):
         """Rank 0: seed_everything(seed + 0) == seed_everything(seed)."""
         tc = base_train_config(seed=7)
@@ -513,7 +499,7 @@ class TestOnFitStart:
 
         mock_seed.assert_called_once_with(7, workers=True)
 
-    @patch("rfdetr.training.module.seed_everything")
+    @patch("rfdetr.training.module_model.seed_everything")
     def test_seed_rank_offset(self, mock_seed, base_train_config, build_module):
         """Non-zero rank: seed_everything(seed + global_rank) must be called.
 
@@ -528,7 +514,7 @@ class TestOnFitStart:
 
         mock_seed.assert_called_once_with(9, workers=True)  # 7 + 2
 
-    @patch("rfdetr.training.module.seed_everything")
+    @patch("rfdetr.training.module_model.seed_everything")
     def test_seed_skipped_when_none(self, mock_seed, base_train_config, build_module):
         """No seed means on_fit_start should not call seed_everything."""
         tc = base_train_config(seed=None)
@@ -617,52 +603,6 @@ class TestOnTrainBatchStart:
         module.on_train_batch_start((samples, targets), batch_idx=0)
 
         assert samples.tensors.shape == original_shape
-
-
-class TestTransferBatchToDevice:
-    """Tests for transfer_batch_to_device() — verifies that NestedTensor samples and
-    all target-dict tensors are correctly moved to the target device without unwrapping
-    the NestedTensor into plain tensors."""
-
-    def test_samples_transferred_to_target_device(self, build_module):
-        """Both tensors and mask in NestedTensor must land on the target device."""
-        module, _, _, _ = build_module()
-        samples, targets = _make_batch()
-        device = torch.device("cpu")
-
-        result_samples, _ = module.transfer_batch_to_device((samples, targets), device, dataloader_idx=0)
-
-        assert result_samples.tensors.device == device
-        assert result_samples.mask.device == device
-
-    def test_targets_transferred_to_target_device(self, build_module):
-        """All tensor values in every target dict must be moved to the target device."""
-        module, _, _, _ = build_module()
-        samples, targets = _make_batch()
-        device = torch.device("cpu")
-
-        _, result_targets = module.transfer_batch_to_device((samples, targets), device, dataloader_idx=0)
-
-        for t in result_targets:
-            for v in t.values():
-                assert v.device == device
-
-    def test_returns_tuple_of_correct_length(self, build_module):
-        """Return value must be a (samples, targets) tuple to match batch contract."""
-        module, _, _, _ = build_module()
-        result = module.transfer_batch_to_device(_make_batch(), torch.device("cpu"), dataloader_idx=0)
-
-        assert isinstance(result, tuple)
-        assert len(result) == 2
-
-    def test_preserves_nested_tensor_type(self, build_module):
-        """Device transfer must not unwrap NestedTensor into plain tensors."""
-        module, _, _, _ = build_module()
-        samples, targets = _make_batch()
-
-        result_samples, _ = module.transfer_batch_to_device((samples, targets), torch.device("cpu"), dataloader_idx=0)
-
-        assert isinstance(result_samples, NestedTensor)
 
 
 class TestTrainingStep:
@@ -921,7 +861,7 @@ class TestConfigureOptimizers:
             pytest.param("lr_scheduler", id="lr-scheduler-key"),
         ],
     )
-    @patch("rfdetr.training.module.get_param_dict")
+    @patch("rfdetr.training.module_model.get_param_dict")
     def test_configure_optimizers_returns_required_key(self, mock_get_param_dict, key, tmp_path):
         """Lightning requires both 'optimizer' and 'lr_scheduler' keys in the returned config dict."""
         module, param_dicts = self._setup_module(tmp_path)
@@ -929,7 +869,7 @@ class TestConfigureOptimizers:
 
         assert key in module.configure_optimizers()
 
-    @patch("rfdetr.training.module.get_param_dict")
+    @patch("rfdetr.training.module_model.get_param_dict")
     def test_optimizer_is_adamw(self, mock_get_param_dict, tmp_path):
         """RF-DETR must use AdamW for its decoupled weight decay behavior."""
         module, param_dicts = self._setup_module(tmp_path)
@@ -937,7 +877,7 @@ class TestConfigureOptimizers:
 
         assert isinstance(module.configure_optimizers()["optimizer"], torch.optim.AdamW)
 
-    @patch("rfdetr.training.module.get_param_dict")
+    @patch("rfdetr.training.module_model.get_param_dict")
     def test_scheduler_interval_is_step(self, mock_get_param_dict, tmp_path):
         """Scheduler must step per batch (not per epoch) for fine-grained warmup."""
         module, param_dicts = self._setup_module(tmp_path)
@@ -952,7 +892,7 @@ class TestConfigureOptimizers:
             pytest.param(50, "warmup_mid", id="warmup-midpoint"),
         ],
     )
-    @patch("rfdetr.training.module.get_param_dict")
+    @patch("rfdetr.training.module_model.get_param_dict")
     def test_lr_lambda_warmup_phase(self, mock_get_param_dict, step, expected_behavior, tmp_path):
         """LR lambda must produce a linear ramp during the warmup phase."""
         module, param_dicts = self._setup_module(tmp_path, warmup_epochs=1.0, epochs=10)
@@ -966,7 +906,7 @@ class TestConfigureOptimizers:
         expected = float(step) / float(max(1, 100))
         assert lr_lambda(step) == pytest.approx(expected)
 
-    @patch("rfdetr.training.module.get_param_dict")
+    @patch("rfdetr.training.module_model.get_param_dict")
     def test_lr_lambda_step_decay_before_drop(self, mock_get_param_dict, tmp_path):
         """Before lr_drop epoch, the LR multiplier must remain at 1.0."""
         module, param_dicts = self._setup_module(tmp_path, warmup_epochs=0.0, epochs=10, lr_drop=8)
@@ -979,7 +919,7 @@ class TestConfigureOptimizers:
         # lr_drop * steps_per_epoch = 8 * 100 = 800; step 500 < 800 → factor 1.0
         assert lr_lambda(500) == pytest.approx(1.0)
 
-    @patch("rfdetr.training.module.get_param_dict")
+    @patch("rfdetr.training.module_model.get_param_dict")
     def test_lr_lambda_step_decay_after_drop(self, mock_get_param_dict, tmp_path):
         """After lr_drop epoch, the LR multiplier must decay to 0.1."""
         module, param_dicts = self._setup_module(tmp_path, warmup_epochs=0.0, epochs=10, lr_drop=8)
@@ -992,7 +932,7 @@ class TestConfigureOptimizers:
         # step 900 > 800 → factor 0.1
         assert lr_lambda(900) == pytest.approx(0.1)
 
-    @patch("rfdetr.training.module.get_param_dict")
+    @patch("rfdetr.training.module_model.get_param_dict")
     def test_lr_lambda_cosine_reads_train_config_fields(self, mock_get_param_dict, tmp_path):
         """Cosine scheduler must read lr_scheduler/lr_min_factor from TrainConfig."""
         module, param_dicts = self._setup_module(
@@ -1003,9 +943,6 @@ class TestConfigureOptimizers:
             lr_min_factor=0.2,
         )
         module._trainer.estimated_stepping_batches = 1000
-        # Guard against regressions that read deprecated Namespace fields.
-        delattr(module._args, "lr_scheduler")
-        delattr(module._args, "lr_min_factor")
         mock_get_param_dict.return_value = param_dicts
 
         scheduler = module.configure_optimizers()["lr_scheduler"]["scheduler"]

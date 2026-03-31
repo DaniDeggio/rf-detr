@@ -5,14 +5,17 @@
 # ------------------------------------------------------------------------
 from __future__ import annotations
 
+import functools
 import glob
+import importlib
 import json
+import operator
 import os
 import warnings
 from collections import defaultdict
 from copy import deepcopy
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import requests
@@ -20,36 +23,24 @@ import torch
 
 if TYPE_CHECKING:
     import supervision as sv
+
 import torchvision.transforms.functional as F
 import yaml
 from PIL import Image
 
-from rfdetr.assets.coco_classes import COCO_CLASSES
-from rfdetr.assets.model_weights import download_pretrain_weights, validate_pretrain_weights
+from rfdetr.assets.coco_classes import COCO_CLASS_NAMES
+from rfdetr.assets.model_weights import download_pretrain_weights
 from rfdetr.config import (
     ModelConfig,
-    RFDETRBaseConfig,  # DEPRECATED
-    RFDETRLargeConfig,
-    RFDETRLargeDeprecatedConfig,  # DEPRECATED
-    RFDETRMediumConfig,
-    RFDETRNanoConfig,
-    RFDETRSeg2XLargeConfig,
-    RFDETRSegLargeConfig,
-    RFDETRSegMediumConfig,
-    RFDETRSegNanoConfig,
-    RFDETRSegPreviewConfig,  # DEPRECATED
-    RFDETRSegSmallConfig,
-    RFDETRSegXLargeConfig,
-    RFDETRSmallConfig,
-    SegmentationTrainConfig,
     TrainConfig,
 )
 from rfdetr.datasets.coco import is_valid_coco_dataset
 from rfdetr.datasets.yolo import is_valid_yolo_dataset
-from rfdetr.models import PostProcess, build_model
+from rfdetr.inference import ModelContext, _build_model_context
+from rfdetr.utilities.decorators import deprecated
+from rfdetr.utilities.distributed import is_main_process
 from rfdetr.export.postprocessed_export import PostprocessedExportModule
 from rfdetr.utilities.logger import get_logger
-from rfdetr.utilities.state_dict import validate_checkpoint_compatibility
 
 try:
     torch.set_float32_matmul_precision("high")
@@ -58,177 +49,114 @@ except Exception:
 
 logger = get_logger()
 
-
-class _ModelContext:
-    """Lightweight model wrapper returned by RFDETR.get_model().
-
-    Provides the same attribute interface as the legacy ``main.py:Model`` but
-    without importing or depending on ``populate_args()`` or the legacy stack.
-
-    Args:
-        model: The underlying ``nn.Module`` (LWDETR instance).
-        postprocess: PostProcess instance for converting raw outputs to boxes.
-        device: Device the model lives on.
-        resolution: Input resolution (square side length in pixels).
-        args: Namespace produced by :func:`build_namespace`.
-        class_names: Optional list of class name strings loaded from checkpoint.
-    """
-
-    def __init__(
-        self,
-        model: torch.nn.Module,
-        postprocess: PostProcess,
-        device: torch.device,
-        resolution: int,
-        args: Any,
-        class_names: List[str] = None,
-    ) -> None:
-        self.model = model
-        self.postprocess = postprocess
-        self.device = device
-        self.resolution = resolution
-        self.args = args
-        self.class_names = class_names
-        self.inference_model = None
-
-    def reinitialize_detection_head(self, num_classes: int) -> None:
-        """Reinitialize the detection head for a different number of classes.
-
-        Args:
-            num_classes: New number of output classes (including background).
-        """
-        self.model.reinitialize_detection_head(num_classes)
-        self.args.num_classes = num_classes
+# ModelContext and _build_model_context are eagerly imported above (runtime use in get_model).
+_VARIANT_EXPORTS = (
+    "RFDETRBase",
+    "RFDETRLarge",
+    "RFDETRLargeDeprecated",
+    "RFDETRMedium",
+    "RFDETRNano",
+    "RFDETRSeg",
+    "RFDETRSeg2XLarge",
+    "RFDETRSegLarge",
+    "RFDETRSegMedium",
+    "RFDETRSegNano",
+    "RFDETRSegPreview",
+    "RFDETRSegSmall",
+    "RFDETRSegXLarge",
+    "RFDETRSmall",
+)
+__all__ = ["RFDETR", "ModelContext", *_VARIANT_EXPORTS]
 
 
-def _load_pretrain_weights_into(nn_model: torch.nn.Module, args: Any) -> List[str]:
-    """Load pretrained checkpoint weights into *nn_model* in-place.
-
-    Mirrors ``Model.__init__`` and ``RFDETRModule._load_pretrain_weights``
-    checkpoint loading logic: validates hash, re-downloads on corruption, and
-    trims query embeddings to match the configured query count.
+def _validate_shape_dims(
+    shape: object,
+    block_size: int,
+    patch_size: int,
+    num_windows: int,
+) -> tuple[int, int]:
+    """Validate a user-supplied ``(height, width)`` shape tuple and return normalised plain-int dims.
 
     Args:
-        nn_model: The model to load weights into.
-        args: Namespace with ``pretrain_weights``, ``num_classes``,
-            ``num_queries``, and ``group_detr`` attributes.
+        shape: The raw value supplied by the caller (e.g. from ``export(shape=...)`` or
+            ``predict(shape=...)``).  Must be a two-element sequence of positive integers
+            (or integer-compatible types accepted by :func:`operator.index`).
+        block_size: Required divisor for both dimensions.  Equals ``patch_size * num_windows``.
+        patch_size: Backbone patch size — used only in error messages.
+        num_windows: Number of attention windows — used only in error messages.
 
     Returns:
-        List of class names extracted from the checkpoint, or empty list.
+        A ``(height, width)`` tuple of plain Python :class:`int` values.
+
+    Raises:
+        ValueError: If ``shape`` cannot be unpacked as a two-element sequence, if either
+            dimension is a bool, float, or other non-integer type, if either dimension is
+            not positive, or if either dimension is not divisible by ``block_size``.
+
     """
-    class_names: List[str] = []
-
-    download_pretrain_weights(args.pretrain_weights)
-    if not os.path.isfile(args.pretrain_weights):
-        logger.warning("Pretrain weights not found after initial download; retrying without MD5 validation.")
-        download_pretrain_weights(args.pretrain_weights, redownload=True, validate_md5=False)
-    validate_pretrain_weights(args.pretrain_weights, strict=False)
-
     try:
-        checkpoint = torch.load(args.pretrain_weights, map_location="cpu", weights_only=False)
-    except Exception:
-        logger.info("Failed to load pretrain weights, re-downloading")
-        download_pretrain_weights(args.pretrain_weights, redownload=True, validate_md5=False)
-        checkpoint = torch.load(args.pretrain_weights, map_location="cpu", weights_only=False)
-
-    if "args" in checkpoint and hasattr(checkpoint["args"], "class_names"):
-        class_names = checkpoint["args"].class_names or []
-
-    validate_checkpoint_compatibility(checkpoint, args)
-
-    checkpoint_num_classes = checkpoint["model"]["class_embed.bias"].shape[0]
-    if checkpoint_num_classes != args.num_classes + 1:
-        logger.warning(
-            "Reinitializing detection head: checkpoint has %d classes, configured for %d.",
-            checkpoint_num_classes - 1,
-            args.num_classes,
+        height, width = shape  # type: ignore[misc]
+    except (TypeError, ValueError):
+        raise ValueError(f"shape must be a sequence of two positive integers (height, width), got {shape!r}.") from None
+    for dim_name, dim in (("height", height), ("width", width)):
+        if isinstance(dim, bool):
+            raise ValueError(f"shape {dim_name} must be an integer, got {type(dim).__name__} (shape={shape!r}).")
+        try:
+            operator.index(dim)
+        except TypeError:
+            raise ValueError(
+                f"shape {dim_name} must be an integer, got {type(dim).__name__} (shape={shape!r}).",
+            ) from None
+        if dim <= 0:
+            raise ValueError(f"shape must contain positive integers for height and width, got {shape!r}.")
+    # Normalise to plain Python ints; also accepts numpy.int64, torch scalars, etc.
+    height, width = operator.index(height), operator.index(width)
+    if height % block_size != 0 or width % block_size != 0:
+        raise ValueError(
+            f"shape must have both dimensions divisible by {block_size} "
+            f"(patch_size={patch_size} * num_windows={num_windows}), got {shape!r}.",
         )
-        nn_model.reinitialize_detection_head(checkpoint_num_classes)
-
-    num_desired_queries = args.num_queries * args.group_detr
-    query_param_names = ["refpoint_embed.weight", "query_feat.weight"]
-    for name in list(checkpoint["model"].keys()):
-        if any(name.endswith(x) for x in query_param_names):
-            checkpoint["model"][name] = checkpoint["model"][name][:num_desired_queries]
-
-    nn_model.load_state_dict(checkpoint["model"], strict=False)
-
-    if checkpoint_num_classes != args.num_classes + 1:
-        nn_model.reinitialize_detection_head(args.num_classes + 1)
-
-    return class_names
+    return height, width
 
 
-def _apply_lora_to(nn_model: torch.nn.Module) -> None:
-    """Apply LoRA adapters to the backbone encoder of *nn_model*.
+def _resolve_patch_size(patch_size: int | None, model_config: object, caller: str) -> int:
+    """Resolve and validate the ``patch_size`` argument for :meth:`RFDETR.export` and :meth:`RFDETR.predict`.
 
     Args:
-        nn_model: LWDETR model whose backbone encoder will receive LoRA.
-    """
-    from peft import LoraConfig, get_peft_model
-
-    lora_config = LoraConfig(
-        r=16,
-        lora_alpha=16,
-        use_dora=True,
-        target_modules=[
-            "q_proj",
-            "v_proj",
-            "k_proj",
-            "qkv",
-            "query",
-            "key",
-            "value",
-            "cls_token",
-            "register_tokens",
-        ],
-    )
-    nn_model.backbone[0].encoder = get_peft_model(nn_model.backbone[0].encoder, lora_config)
-
-
-def _build_model_context(model_config: ModelConfig) -> "_ModelContext":
-    """Build a _ModelContext from ModelConfig without using legacy main.py:Model.
-
-    Replicates ``Model.__init__`` logic: builds the nn.Module, optionally loads
-    pretrain weights and applies LoRA, then moves the model to the target device.
-
-    Args:
-        model_config: Architecture configuration.
+        patch_size: Value supplied by the caller, or ``None`` to read from ``model_config``.
+        model_config: The model's configuration object.  Must expose ``patch_size`` as a
+            positive integer attribute when ``patch_size`` is ``None`` or when a mismatch
+            check is needed.
+        caller: Name of the calling method (``"export"`` or ``"predict"``) — used in
+            error messages to help the caller locate the problem.
 
     Returns:
-        Fully initialised _ModelContext ready for inference or training.
+        A validated, positive :class:`int` patch size.
+
+    Raises:
+        ValueError: If the resolved or provided ``patch_size`` is not a positive integer,
+            or if a caller-provided value disagrees with ``model_config.patch_size``.
+
     """
-    from rfdetr._namespace import build_namespace
-
-    # A dummy TrainConfig is needed only for build_namespace's required fields;
-    # dataset_dir/output_dir are unused during model construction.
-    args = build_namespace(model_config, TrainConfig(dataset_dir=".", output_dir="."))
-    nn_model = build_model(args)
-
-    class_names: List[str] = []
-    if args.pretrain_weights is not None:
-        class_names = _load_pretrain_weights_into(nn_model, args)
-
-    if args.backbone_lora:
-        _apply_lora_to(nn_model)
-
-    device = torch.device(args.device)
-    nn_model = nn_model.to(device)
-    postprocess = PostProcess(num_select=args.num_select)
-
-    return _ModelContext(
-        model=nn_model,
-        postprocess=postprocess,
-        device=device,
-        resolution=model_config.resolution,
-        args=args,
-        class_names=class_names or None,
-    )
+    if patch_size is None:
+        patch_size = getattr(model_config, "patch_size", 14)
+    else:
+        if isinstance(patch_size, bool) or not isinstance(patch_size, int) or patch_size <= 0:
+            raise ValueError(f"patch_size must be a positive integer, got {patch_size!r}")
+        model_patch_size = getattr(model_config, "patch_size", None)
+        if model_patch_size is not None and patch_size != model_patch_size:
+            raise ValueError(
+                f"{caller}(patch_size={patch_size}) does not match the instantiated model's "
+                f"patch_size={model_patch_size}. Patch size is an architectural parameter; "
+                f"omit patch_size to use the model's configured value.",
+            )
+    if isinstance(patch_size, bool) or not isinstance(patch_size, int) or patch_size <= 0:
+        raise ValueError(f"patch_size must be a positive integer, got {patch_size!r}")
+    return patch_size
 
 
 class RFDETR:
-    """
-    The base RF-DETR class implements the core methods for training RF-DETR models,
+    """The base RF-DETR class implements the core methods for training RF-DETR models,
     running inference on the models, optimising models, and uploading trained
     models for deployment.
     """
@@ -236,6 +164,8 @@ class RFDETR:
     means = [0.485, 0.456, 0.406]
     stds = [0.229, 0.224, 0.225]
     size = None
+    _model_config_class: type[ModelConfig] = ModelConfig
+    _train_config_class: type[TrainConfig] = TrainConfig
 
     def __init__(self, **kwargs):
         self.model_config = self.get_model_config(**kwargs)
@@ -252,19 +182,188 @@ class RFDETR:
         self._optimized_dtype = None
 
     def maybe_download_pretrain_weights(self):
-        """
-        Download pre-trained weights if they are not already downloaded.
-        """
+        """Download pre-trained weights if they are not already downloaded."""
         pretrain_weights = self.model_config.pretrain_weights
         if pretrain_weights is None:
             return
         download_pretrain_weights(pretrain_weights)
 
-    def get_model_config(self, **kwargs):
+    def get_model_config(self, **kwargs) -> ModelConfig:
+        """Retrieve the configuration parameters used by the model."""
+        return self._model_config_class(**kwargs)
+
+    @classmethod
+    def from_checkpoint(cls, path: str | os.PathLike[str], **kwargs: Any) -> RFDETR:
+        """Load an RF-DETR model from a training checkpoint, automatically
+        inferring the model size from the saved args.
+
+        The correct subclass is inferred from the ``pretrain_weights`` field
+        stored in the checkpoint's ``args`` entry.  Both legacy
+        ``argparse.Namespace`` checkpoints (produced by ``engine.py``) and
+        dict-style checkpoints (produced by the PTL training stack) are
+        supported.
+
+        Args:
+            path: Path to a checkpoint file (e.g. ``checkpoint_best_total.pth``).
+            **kwargs: Additional keyword arguments forwarded to the model
+                constructor (e.g. ``accept_platform_model_license=True`` for
+                XLarge / 2XLarge models).
+
+        Returns:
+            An instance of the appropriate :class:`RFDETR` subclass loaded from
+            the checkpoint.
+
+        Warning:
+            This method calls ``torch.load`` with ``weights_only=False``, which
+            unpickles arbitrary Python objects. Only load checkpoints from
+            trusted sources.
+
+        Raises:
+            FileNotFoundError: If *path* does not exist.
+            OSError: If *path* exists but cannot be read.
+            KeyError: If the checkpoint does not contain an ``"args"`` key.
+            ValueError: If the model size cannot be inferred from the
+                ``pretrain_weights`` field in the saved args.
+
+        Examples:
+            >>> model = RFDETR.from_checkpoint("checkpoint_best_total.pth")  # doctest: +SKIP
+            >>> model = RFDETRSmall.from_checkpoint("checkpoint_best_total.pth")  # doctest: +SKIP
         """
-        Retrieve the configuration parameters used by the model.
+        # Local imports break the variants → detr import cycle.
+        from rfdetr.variants import (
+            RFDETRBase,
+            RFDETRLarge,
+            RFDETRMedium,
+            RFDETRNano,
+            RFDETRSeg2XLarge,
+            RFDETRSegLarge,
+            RFDETRSegMedium,
+            RFDETRSegNano,
+            RFDETRSegPreview,
+            RFDETRSegSmall,
+            RFDETRSegXLarge,
+            RFDETRSmall,
+        )
+
+        _plus_available = False
+        try:
+            from rfdetr.platform.models import RFDETR2XLarge, RFDETRXLarge
+
+            _plus_entries: list[tuple[str, type[RFDETR]]] = [
+                ("2xlarge", RFDETR2XLarge),  # alias for "rfdetr-2xlarge" size label (training ckpts)
+                ("xxlarge", RFDETR2XLarge),  # official weight filename "rf-detr-xxlarge.pth"
+                ("xlarge", RFDETRXLarge),
+            ]
+            _plus_available = True
+        except ImportError:
+            _plus_entries = []
+
+        # weights_only=False is required because legacy checkpoints embed
+        # argparse.Namespace objects that cannot be deserialised with
+        # weights_only=True.
+        ckpt: dict[str, Any] = torch.load(path, map_location="cpu", weights_only=False)
+        args = ckpt["args"]
+
+        if isinstance(args, dict):
+            weights_name = str(args.get("pretrain_weights", "")).lower()
+        else:
+            weights_name = str(getattr(args, "pretrain_weights", "")).lower()
+
+        # Guard: "xlarge"/"xxlarge" without a "seg-" prefix are plus-only models.
+        # Without the plus package, "xlarge" would otherwise silently fall through
+        # to the generic "large" key and instantiate the wrong class.
+        if not _plus_available and "xlarge" in weights_name and "seg-" not in weights_name:
+            from rfdetr.platform import _INSTALL_MSG
+
+            raise ImportError(
+                f"Checkpoint pretrain_weights={weights_name!r} requires the "
+                f"rfdetr_plus package. " + _INSTALL_MSG.format(name="platform model downloads")
+            )
+
+        # Ordered most-specific first so "seg-xxlarge"/"seg-2xlarge" match before
+        # "seg-xlarge", "xxlarge" before "xlarge", and "seg-*" prefixes before
+        # their bare counterparts.
+        _model_map: list[tuple[str, type[RFDETR]]] = [
+            ("seg-2xlarge", RFDETRSeg2XLarge),  # alias for "rfdetr-seg-2xlarge" size label
+            ("seg-xxlarge", RFDETRSeg2XLarge),  # official weight filename "rf-detr-seg-xxlarge.pt"
+            ("seg-xlarge", RFDETRSegXLarge),
+            ("seg-large", RFDETRSegLarge),
+            ("seg-medium", RFDETRSegMedium),
+            ("seg-small", RFDETRSegSmall),
+            ("seg-nano", RFDETRSegNano),
+            ("seg-preview", RFDETRSegPreview),
+            *_plus_entries,
+            ("large", RFDETRLarge),
+            ("medium", RFDETRMedium),
+            ("small", RFDETRSmall),
+            ("nano", RFDETRNano),
+            ("base", RFDETRBase),
+        ]
+
+        model_cls: type[RFDETR] | None = None
+        for name, klass in _model_map:
+            if name in weights_name:
+                model_cls = klass
+                break
+
+        if model_cls is None:
+            raise ValueError(
+                f"Could not infer model size from pretrain_weights={weights_name!r}. "
+                "Please instantiate the model class directly."
+            )
+
+        if isinstance(args, dict):
+            num_classes: int | None = args.get("num_classes")
+        else:
+            num_classes = getattr(args, "num_classes", None)
+
+        # pretrain_weights is placed after **kwargs so it always wins even if
+        # a caller accidentally passes pretrain_weights inside kwargs.
+        constructor_kwargs: dict[str, Any] = {**kwargs, "pretrain_weights": str(path)}
+        if num_classes is not None and "num_classes" not in kwargs:
+            constructor_kwargs["num_classes"] = num_classes
+
+        return model_cls(**constructor_kwargs)
+
+    @staticmethod
+    def _resolve_trainer_device_kwargs(device: Any) -> tuple[str | None, list[int] | None]:
+        """Map a torch-style device specifier to PTL ``accelerator``/``devices`` kwargs.
+
+        Args:
+            device: A device specifier accepted by ``torch.device``.
+
+        Returns:
+            ``(accelerator, devices)`` where ``devices`` is ``None`` unless an explicit
+            device index is provided (for example ``cuda:1``).
+
+        Raises:
+            ValueError: If ``device`` is not a valid torch device specifier.
+
         """
-        return ModelConfig(**kwargs)
+        if device is None:
+            return None, None
+        try:
+            resolved_device = torch.device(device)
+        except (TypeError, ValueError, RuntimeError) as exc:
+            raise ValueError(
+                f"Invalid device specifier for train(): {device!r}. "
+                "Expected values like 'cpu', 'cuda', 'cuda:0', or torch.device(...).",
+            ) from exc
+
+        if resolved_device.type == "cpu":
+            return "cpu", None
+        if resolved_device.type == "cuda":
+            return "gpu", [resolved_device.index] if resolved_device.index is not None else None
+        if resolved_device.type == "mps":
+            return "mps", [resolved_device.index] if resolved_device.index is not None else None
+
+        warnings.warn(
+            f"Device type {resolved_device.type!r} is not explicitly mapped to a PyTorch Lightning "
+            "accelerator; falling back to PTL auto-detection. Training may use an unexpected device.",
+            UserWarning,
+            stacklevel=2,
+        )
+        return None, None
 
     def train(self, **kwargs):
         """Train an RF-DETR model via the PyTorch Lightning stack.
@@ -273,8 +372,12 @@ class RFDETR:
         a :class:`~rfdetr.config.TrainConfig`.  Several legacy kwargs are absorbed
         so existing call-sites do not break:
 
-        * ``device`` — mapped to ``TrainConfig.accelerator``; ``"cpu"`` becomes
-          ``accelerator="cpu"``, all others default to ``"auto"``.
+        * ``device`` — normalized via :class:`torch.device` and mapped to PyTorch
+          Lightning trainer arguments. ``"cpu"`` becomes ``accelerator="cpu"``;
+          ``"cuda"`` and ``"cuda:N"`` become ``accelerator="gpu"`` and optionally
+          ``devices=[N]``; ``"mps"`` becomes ``accelerator="mps"``. Other valid
+          torch device types fall back to PTL auto-detection and emit a
+          :class:`UserWarning`.
         * ``callbacks`` — if the dict contains any non-empty lists a
           :class:`DeprecationWarning` is emitted; the dict is then discarded.
           Use PTL :class:`~pytorch_lightning.Callback` objects passed via
@@ -285,8 +388,28 @@ class RFDETR:
         After training completes the underlying ``nn.Module`` is synced back
         onto ``self.model.model`` so that :meth:`predict` and :meth:`export`
         continue to work without reloading the checkpoint.
+
+        Raises:
+            ImportError: If training dependencies are not installed. Install with
+                ``pip install "rfdetr[train,loggers]"``.
+
         """
-        from rfdetr.training import RFDETRDataModule, RFDETRModule, build_trainer
+        # Both imports are grouped in a single try block because they both live in
+        # the `rfdetr[train]` extras group — a missing `pytorch_lightning` (or any
+        # other training-extras package) causes either import to fail, and the
+        # remediation is identical: `pip install "rfdetr[train,loggers]"`.
+        try:
+            from rfdetr.training import RFDETRDataModule, RFDETRModelModule, build_trainer
+            from rfdetr.training.auto_batch import resolve_auto_batch_config
+        except ModuleNotFoundError as exc:
+            # Preserve internal import errors so packaging/regression issues in
+            # rfdetr.* are not misreported as missing optional extras.
+            if exc.name and exc.name.startswith("rfdetr."):
+                raise
+            raise ImportError(
+                "RF-DETR training dependencies are missing. "
+                'Install them with `pip install "rfdetr[train,loggers]"` and try again.',
+            ) from exc
 
         # Absorb legacy `callbacks` dict — warn if non-empty, then discard.
         callbacks_dict = kwargs.pop("callbacks", None)
@@ -297,12 +420,10 @@ class RFDETR:
                 stacklevel=2,
             )
 
-        # Absorb legacy `device` kwarg.  When the caller explicitly requests CPU
-        # (e.g. in tests or CPU-only environments), honour it by forwarding it as
-        # the PTL accelerator.  All other device strings (cuda, mps) are ignored
-        # so PTL can auto-select the best available device.
+        # Parse `device` kwarg and map it to PTL accelerator/devices.
+        # Supports torch-style strings and torch.device (e.g. "cuda:1").
         _device = kwargs.pop("device", None)
-        _accelerator = "cpu" if _device == "cpu" else None
+        _accelerator, _devices = RFDETR._resolve_trainer_device_kwargs(_device)
 
         # Absorb legacy `start_epoch` — PTL resumes automatically via ckpt_path.
         if "start_epoch" in kwargs:
@@ -323,13 +444,63 @@ class RFDETR:
             )
 
         config = self.get_train_config(**kwargs)
-        module = RFDETRModule(self.model_config, config)
+        if config.batch_size == "auto":
+            auto_batch = resolve_auto_batch_config(
+                model_context=self.model,
+                model_config=self.model_config,
+                train_config=config,
+            )
+            config.batch_size = auto_batch.safe_micro_batch
+            config.grad_accum_steps = auto_batch.recommended_grad_accum_steps
+            logger.info(
+                "[auto-batch] resolved train config: batch_size=%s grad_accum_steps=%s effective_batch_size=%s",
+                config.batch_size,
+                config.grad_accum_steps,
+                auto_batch.effective_batch_size,
+            )
+
+        # Auto-detect num_classes from the training dataset and align model_config.
+        # This must run before RFDETRModelModule is constructed so that weight loading
+        # inside the module uses the correct (dataset-derived) class count.
+        dataset_dir = getattr(config, "dataset_dir", None)
+        if dataset_dir:
+            self._align_num_classes_from_dataset(dataset_dir)
+
+        module = RFDETRModelModule(self.model_config, config)
         datamodule = RFDETRDataModule(self.model_config, config)
-        trainer = build_trainer(config, self.model_config, accelerator=_accelerator)
+        trainer_kwargs = {"accelerator": _accelerator}
+        if _devices is not None:
+            trainer_kwargs["devices"] = _devices
+        trainer = build_trainer(config, self.model_config, **trainer_kwargs)
         trainer.fit(module, datamodule, ckpt_path=config.resume or None)
 
         # Sync the trained weights back so predict() / export() see the updated model.
         self.model.model = module.model
+        # Sync class names: prefer explicit config.class_names, otherwise fall back to dataset (#509).
+        config_class_names = getattr(config, "class_names", None)
+        if config_class_names is not None:
+            self.model.class_names = config_class_names
+        else:
+            dataset_class_names = getattr(datamodule, "class_names", None)
+            if dataset_class_names is not None:
+                self.model.class_names = dataset_class_names
+
+        # Save complete training configuration to disk for reproducibility.
+        # Guard to main process only to avoid races in distributed/multi-GPU training.
+        if is_main_process():
+            complete_config = {
+                "train_config": config.model_dump(),
+                "model_config": self.model_config.model_dump(),
+                "model_config_type": self.model_config.__class__.__name__,
+                "class_names": self.model.class_names,
+                "num_classes": len(self.model.class_names) if self.model.class_names else 0,
+            }
+            try:
+                os.makedirs(config.output_dir, exist_ok=True)
+                with open(os.path.join(config.output_dir, "training_config.json"), "w") as f:
+                    json.dump(complete_config, f, indent=2, default=str)
+            except OSError as exc:
+                logger.warning("Could not save training_config.json to %s: %s", config.output_dir, exc)
 
     def optimize_for_inference(self, compile=True, batch_size=1, dtype=torch.float32):
         self.remove_optimized_model()
@@ -348,7 +519,12 @@ class RFDETR:
             self.model.inference_model = torch.jit.trace(
                 self.model.inference_model,
                 torch.randn(
-                    batch_size, 3, self.model.resolution, self.model.resolution, device=self.model.device, dtype=dtype
+                    batch_size,
+                    3,
+                    self.model.resolution,
+                    self.model.resolution,
+                    device=self.model.device,
+                    dtype=dtype,
                 ),
             )
             self._optimized_has_been_compiled = True
@@ -360,8 +536,20 @@ class RFDETR:
         self._optimized_has_been_compiled = False
         self._optimized_batch_size = None
         self._optimized_resolution = None
-        self._optimized_half = False
+        self._optimized_dtype = None
 
+    @deprecated(
+        target=True,
+        # `simplify` / `force` are retained for API compatibility and treated as no-op.
+        args_mapping={
+            "simplify": False,
+            "force": False,
+        },
+        deprecated_in="1.6",
+        remove_in="1.8",
+        num_warns=1,
+        stream=functools.partial(warnings.warn, category=DeprecationWarning, stacklevel=2),
+    )
     def export(
         self,
         output_dir: str = "output",
@@ -371,8 +559,10 @@ class RFDETR:
         opset_version: int = 17,
         verbose: bool = True,
         force: bool = False,
-        shape: tuple = None,
+        shape: tuple[int, int] | None = None,
         batch_size: int = 1,
+        dynamic_batch: bool = False,
+        patch_size: int | None = None,
         postprocess: bool = False,
         output_mask: bool = True,
         **kwargs,
@@ -385,22 +575,30 @@ class RFDETR:
         Args:
             output_dir: Directory to write the ONNX file to.
             infer_dir: Optional directory of sample images for dynamic-axes inference.
-            simplify: Whether to run onnx-simplifier on the exported graph.
+            simplify: Deprecated and ignored. Simplification is no longer run.
             backbone_only: Export only the backbone (feature extractor).
             opset_version: ONNX opset version to target.
             verbose: Print export progress information.
-            force: Force re-export even if output already exists.
+            force: Deprecated and ignored.
             shape: ``(height, width)`` tuple; defaults to square at model resolution.
+                Both dimensions must be divisible by ``patch_size * num_windows``.
             batch_size: Static batch size to bake into the ONNX graph.
+            dynamic_batch: If True, export with a dynamic batch dimension
+                so the ONNX model accepts variable batch sizes at runtime.
+            patch_size: Backbone patch size. Defaults to the value stored in
+                ``model_config.patch_size`` (typically 14 or 16). When provided
+                explicitly it must match the instantiated model's patch size.
+                Shape divisibility is validated against ``patch_size * num_windows``.
             **kwargs: Additional keyword arguments forwarded to export_onnx.
+
         """
         logger.info("Exporting model to ONNX format")
         try:
-            from rfdetr.export.main import export_onnx, make_infer_image, onnx_simplify
+            from rfdetr.export.main import export_onnx, make_infer_image
         except ImportError:
             logger.error(
                 "It seems some dependencies for ONNX export are missing."
-                " Please run `pip install rfdetr[onnx]` and try again."
+                " Please run `pip install rfdetr[onnx]` and try again.",
             )
             raise
 
@@ -410,11 +608,21 @@ class RFDETR:
 
         os.makedirs(output_dir, exist_ok=True)
         output_dir_path = Path(output_dir)
+        patch_size = _resolve_patch_size(patch_size, self.model_config, "export")
+        num_windows = getattr(self.model_config, "num_windows", 1)
+        if isinstance(num_windows, bool) or not isinstance(num_windows, int) or num_windows <= 0:
+            raise ValueError(f"num_windows must be a positive integer, got {num_windows!r}")
+        block_size = patch_size * num_windows
         if shape is None:
             shape = (self.model.resolution, self.model.resolution)
+            if shape[0] % block_size != 0:
+                raise ValueError(
+                    f"Model's default resolution ({self.model.resolution}) is not divisible by "
+                    f"block_size={block_size} (patch_size={patch_size} * num_windows={num_windows}). "
+                    f"Provide an explicit shape divisible by {block_size}.",
+                )
         else:
-            if shape[0] % 14 != 0 or shape[1] % 14 != 0:
-                raise ValueError("Shape must be divisible by 14")
+            shape = _validate_shape_dims(shape, block_size, patch_size, num_windows)
 
         input_tensors = make_infer_image(infer_dir, shape, batch_size, device).to(device)
         input_names = ["input"]
@@ -428,7 +636,10 @@ class RFDETR:
         else:
             output_names = ["dets", "labels"]
 
-        dynamic_axes = None
+        if dynamic_batch:
+            dynamic_axes = {name: {0: "batch"} for name in input_names + output_names}
+        else:
+            dynamic_axes = None
         model.eval()
         with torch.no_grad():
             if backbone_only:
@@ -442,7 +653,7 @@ class RFDETR:
                 if isinstance(masks, torch.Tensor):
                     logger.debug(
                         f"PyTorch inference output shapes - Boxes: {dets.shape}, Labels: {labels.shape}, "
-                        f"Masks: {masks.shape}"
+                        f"Masks: {masks.shape}",
                     )
                 else:
                     logger.debug(f"PyTorch inference output shapes - Boxes: {dets.shape}, Labels: {labels.shape}")
@@ -477,21 +688,15 @@ class RFDETR:
 
         logger.info(f"Successfully exported ONNX model to: {output_file}")
 
-        if simplify:
-            sim_output_file = onnx_simplify(
-                onnx_dir=output_file, input_names=input_names, input_tensors=input_tensors, force=force
-            )
-            logger.info(f"Successfully simplified ONNX model to: {sim_output_file}")
-
         logger.info("ONNX export completed successfully")
         self.model.model = self.model.model.to(device)
 
     @staticmethod
-    def _load_classes(dataset_dir: str) -> List[str]:
+    def _load_classes(dataset_dir: str) -> list[str]:
         """Load class names from a COCO or YOLO dataset directory."""
         if is_valid_coco_dataset(dataset_dir):
             coco_path = os.path.join(dataset_dir, "train", "_annotations.coco.json")
-            with open(coco_path, "r") as f:
+            with open(coco_path, encoding="utf-8") as f:
                 anns = json.load(f)
             categories = sorted(anns["categories"], key=lambda category: category.get("id", float("inf")))
 
@@ -519,59 +724,139 @@ class RFDETR:
             # any YAML file starting with data e.g. data.yaml, dataset.yaml
             yaml_data_files = [yp for yp in yaml_paths if os.path.basename(yp).startswith("data")]
             yaml_path = yaml_data_files[0]
-            with open(yaml_path, "r") as f:
+            with open(yaml_path) as f:
                 data = yaml.safe_load(f)
             if "names" in data:
                 if isinstance(data["names"], dict):
                     return [data["names"][i] for i in sorted(data["names"].keys())]
                 return data["names"]
-            else:
-                raise ValueError(f"Found {yaml_path} but it does not contain 'names' field.")
+            raise ValueError(f"Found {yaml_path} but it does not contain 'names' field.")
         raise FileNotFoundError(
             f"Could not find class names in {dataset_dir}."
-            " Checked for COCO (train/_annotations.coco.json) and YOLO (data.yaml, data.yml) styles."
+            " Checked for COCO (train/_annotations.coco.json) and YOLO (data.yaml, data.yml) styles.",
         )
 
-    def get_train_config(self, **kwargs):
-        """
-        Retrieve the configuration parameters that will be used for training.
-        """
-        return TrainConfig(**kwargs)
+    @staticmethod
+    def _detect_num_classes_for_training(dataset_dir: str) -> int:
+        """Detect the class count using the same category basis as training labels.
 
-    def get_model(self, config: ModelConfig) -> "_ModelContext":
+        For COCO-style datasets this counts all categories by ``id`` from
+        ``train/_annotations.coco.json`` (matching the remapping based on
+        ``coco.cats`` used by the training datamodule). For YOLO-style datasets
+        it falls back to ``_load_classes``.
+        """
+        if is_valid_coco_dataset(dataset_dir):
+            coco_path = os.path.join(dataset_dir, "train", "_annotations.coco.json")
+            with open(coco_path, encoding="utf-8") as f:
+                anns = json.load(f)
+            categories = anns["categories"]
+            cat_by_id = {category["id"]: category for category in categories}
+            return len(cat_by_id)
+
+        return len(RFDETR._load_classes(dataset_dir))
+
+    def _align_num_classes_from_dataset(self, dataset_dir: str) -> None:
+        """Auto-detect the dataset class count and align ``model_config.num_classes`` in-place.
+
+        Must be called before ``RFDETRModelModule`` is constructed so that weight loading inside
+        the module uses the correct (dataset-derived) class count.
+
+        When the user did **not** explicitly override ``num_classes`` (or passed the class-config
+        default), ``model_config.num_classes`` and ``self.model.args.num_classes`` are updated
+        to match the dataset.  When the user *did* set a non-default value that differs from the
+        dataset, the configured value is preserved and a warning is emitted.
+
+        Failures from ``_detect_num_classes_for_training`` are caught and logged at DEBUG level
+        so that training is never blocked by detection errors.
+
+        Args:
+            dataset_dir: Path to the training dataset root directory.
+        """
+        try:
+            dataset_num_classes = RFDETR._detect_num_classes_for_training(dataset_dir)
+        except (FileNotFoundError, ValueError, KeyError, OSError) as exc:
+            # Best-effort only; do not block training if detection fails.
+            logger.debug("Could not auto-detect num_classes from dataset '%s': %s", dataset_dir, exc)
+            return
+
+        model_num_classes = self.model_config.num_classes
+
+        if dataset_num_classes == model_num_classes:
+            return
+
+        # Determine whether the user explicitly overrode num_classes to a non-default value.
+        # "num_classes" in model_fields_set is True when the field was explicitly set at
+        # construction time; comparing against the class default filters out cases where the
+        # user passed the default value explicitly (treat those like "not set").
+        user_set = "num_classes" in getattr(self.model_config, "model_fields_set", set())
+        default_nc = type(self.model_config).model_fields["num_classes"].default
+        user_overrode = user_set and model_num_classes != default_nc
+
+        if not user_overrode:
+            logger.debug(
+                "Detected %d classes in dataset '%s'; auto-adjusting model num_classes from %d to %d.",
+                dataset_num_classes,
+                dataset_dir,
+                model_num_classes,
+                dataset_num_classes,
+            )
+            self.model_config.num_classes = dataset_num_classes
+            # Keep serialized checkpoint metadata in sync with the updated class count.
+            model_args = getattr(self.model, "args", None)
+            if model_args is not None:
+                model_args.num_classes = dataset_num_classes
+        else:
+            logger.warning(
+                "Dataset '%s' has %d classes but model was initialized with num_classes=%d. "
+                "Using the model's configured value (%d). If this is unintentional, "
+                "reinitialize the model with num_classes=%d.",
+                dataset_dir,
+                dataset_num_classes,
+                model_num_classes,
+                model_num_classes,
+                dataset_num_classes,
+            )
+
+    def get_train_config(self, **kwargs) -> TrainConfig:
+        """Retrieve the configuration parameters that will be used for training."""
+        return self._train_config_class(**kwargs)
+
+    def get_model(self, config: ModelConfig) -> ModelContext:
         """Retrieve a model context from the provided architecture configuration.
 
         Args:
             config: Architecture configuration.
 
         Returns:
-            _ModelContext with model, postprocess, device, resolution, args,
+            ModelContext with model, postprocess, device, resolution, args,
             and class_names attributes.
+
         """
         return _build_model_context(config)
 
-    # Get class_names from the model
     @property
-    def class_names(self):
-        """
-        Retrieve the class names supported by the loaded model.
+    def class_names(self) -> list[str]:
+        """Retrieve the class names supported by the loaded model.
 
         Returns:
-            dict: A dictionary mapping class IDs to class names. The keys are integers starting from
-        """
-        if hasattr(self.model, "class_names") and self.model.class_names:
-            return {i + 1: name for i, name in enumerate(self.model.class_names)}
+            A list of class name strings, 0-indexed.  When no custom class
+            names are embedded in the checkpoint, returns the standard 80
+            COCO class names.
 
-        return COCO_CLASSES
+        """
+        if hasattr(self.model, "class_names") and self.model.class_names is not None:
+            return list(self.model.class_names)
+
+        return list(COCO_CLASS_NAMES)
 
     def predict(
         self,
-        images: Union[
-            str, Image.Image, np.ndarray, torch.Tensor, List[Union[str, np.ndarray, Image.Image, torch.Tensor]]
-        ],
+        images: str | Image.Image | np.ndarray | torch.Tensor | list[str | np.ndarray | Image.Image | torch.Tensor],
         threshold: float = 0.5,
+        shape: tuple[int, int] | None = None,
+        patch_size: int | None = None,
         **kwargs,
-    ) -> Union[sv.Detections, List[sv.Detections]]:
+    ) -> sv.Detections | list[sv.Detections]:
         """Performs object detection on the input images and returns bounding box
         predictions.
 
@@ -586,19 +871,57 @@ class RFDETR:
                 as file paths, PIL Images, NumPy arrays, or torch.Tensors.
             threshold:
                 The minimum confidence score needed to consider a detected bounding box valid.
+            shape:
+                Optional ``(height, width)`` tuple to resize images to before inference.
+                When provided, overrides the model's default inference resolution. The
+                tuple should match the resolution used when exporting the model
+                (typically a square shape). Both dimensions must be positive integers
+                divisible by ``patch_size * num_windows``. Defaults to
+                ``(model.resolution, model.resolution)`` when not set.
+            patch_size:
+                Backbone patch size used for shape divisibility validation. Defaults
+                to ``model_config.patch_size`` (typically 14 for large models, 16 for
+                smaller ones). Divisibility is checked against
+                ``patch_size * num_windows``.
             **kwargs:
                 Additional keyword arguments.
 
         Returns:
             A single or multiple Detections objects, each containing bounding box
             coordinates, confidence scores, and class IDs.
+
+        Raises:
+            ValueError: If ``shape`` cannot be unpacked as a two-element sequence,
+                if either dimension does not support the ``__index__`` protocol
+                (e.g. ``float``) or is a ``bool``, if either dimension is zero or
+                negative, if either dimension is not divisible by
+                ``patch_size * num_windows``, or if ``patch_size`` is not a positive
+                integer.
+
         """
         import supervision as sv
+
+        patch_size = _resolve_patch_size(patch_size, self.model_config, "predict")
+        num_windows = getattr(self.model_config, "num_windows", 1)
+        if isinstance(num_windows, bool) or not isinstance(num_windows, int) or num_windows <= 0:
+            raise ValueError(f"model_config.num_windows must be a positive integer, got {num_windows!r}")
+        block_size = patch_size * num_windows
+
+        if shape is None:
+            default_res = self.model.resolution
+            if default_res % block_size != 0:
+                raise ValueError(
+                    f"Model's default resolution ({default_res}) is not divisible by "
+                    f"block_size={block_size} (patch_size={patch_size} * num_windows={num_windows}). "
+                    f"Provide an explicit shape divisible by {block_size}.",
+                )
+        else:
+            shape = _validate_shape_dims(shape, block_size, patch_size, num_windows)
 
         if not self._is_optimized_for_inference and not self._has_warned_about_not_being_optimized_for_inference:
             logger.warning(
                 "Model is not optimized for inference. Latency may be higher than expected."
-                " You can optimize the model for inference by calling model.optimize_for_inference()."
+                " You can optimize the model for inference by calling model.optimize_for_inference().",
             )
             self._has_warned_about_not_being_optimized_for_inference = True
 
@@ -609,6 +932,7 @@ class RFDETR:
 
         orig_sizes = []
         processed_images = []
+        source_images = []
 
         for img in images:
             if isinstance(img, str):
@@ -617,11 +941,21 @@ class RFDETR:
                 img = Image.open(img)
 
             if not isinstance(img, torch.Tensor):
+                src = np.array(img)
+                if src.dtype != np.uint8:
+                    src = (src * 255).clip(0, 255).astype(np.uint8)
+                source_images.append(src)
                 img = F.to_tensor(img)
+            else:
+                source_images.append((img.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8))
 
             if (img > 1).any():
                 raise ValueError(
-                    "Image has pixel values above 1. Please ensure the image is normalized (scaled to [0, 1])."
+                    "Image has pixel values above 1. Please ensure the image is normalized (scaled to [0, 1]).",
+                )
+            if (img < 0).any():
+                raise ValueError(
+                    "Image has pixel values below 0. Please ensure the image is normalized (scaled to [0, 1]).",
                 )
             if img.shape[0] != 3:
                 raise ValueError(f"Invalid image shape. Expected 3 channels (RGB), but got {img.shape[0]} channels.")
@@ -631,21 +965,26 @@ class RFDETR:
             orig_sizes.append((h, w))
 
             img_tensor = img_tensor.to(self.model.device)
+            resize_to = list(shape) if shape is not None else [self.model.resolution, self.model.resolution]
+            img_tensor = F.resize(img_tensor, resize_to)
             img_tensor = F.normalize(img_tensor, self.means, self.stds)
-            img_tensor = F.resize(img_tensor, (self.model.resolution, self.model.resolution))
 
             processed_images.append(img_tensor)
 
         batch_tensor = torch.stack(processed_images)
 
         if self._is_optimized_for_inference:
-            if self._optimized_resolution != batch_tensor.shape[2]:
-                # this could happen if someone manually changes self.model.resolution after optimizing the model
+            if (
+                self._optimized_resolution != batch_tensor.shape[2]
+                or self._optimized_resolution != batch_tensor.shape[3]
+            ):
+                # this could happen if someone manually changes self.model.resolution after optimizing the model,
+                # or if predict(shape=...) is used with a shape that doesn't match the compiled square resolution.
                 raise ValueError(
                     f"Resolution mismatch. "
-                    f"Model was optimized for resolution {self._optimized_resolution}, "
-                    f"but got {batch_tensor.shape[2]}."
-                    " You can explicitly remove the optimized model by calling model.remove_optimized_model()."
+                    f"Model was optimized for resolution {self._optimized_resolution}x{self._optimized_resolution}, "
+                    f"but got {batch_tensor.shape[2]}x{batch_tensor.shape[3]}."
+                    " You can explicitly remove the optimized model by calling model.remove_optimized_model().",
                 )
             if self._optimized_has_been_compiled:
                 if self._optimized_batch_size != batch_tensor.shape[0]:
@@ -655,7 +994,7 @@ class RFDETR:
                         f"but got {batch_tensor.shape[0]}."
                         " You can explicitly remove the optimized model by calling model.remove_optimized_model()."
                         " Alternatively, you can recompile the optimized model for a different batch size"
-                        " by calling model.optimize_for_inference(batch_size=<new_batch_size>)."
+                        " by calling model.optimize_for_inference(batch_size=<new_batch_size>).",
                     )
 
         with torch.no_grad():
@@ -675,7 +1014,7 @@ class RFDETR:
             results = self.model.postprocess(predictions, target_sizes=target_sizes)
 
         detections_list = []
-        for result in results:
+        for i, result in enumerate(results):
             scores = result["scores"]
             labels = result["labels"]
             boxes = result["boxes"]
@@ -702,6 +1041,9 @@ class RFDETR:
                     class_id=labels.cpu().numpy(),
                 )
 
+            detections.data["source_image"] = source_images[i]
+            detections.data["source_shape"] = orig_sizes[i]
+
             detections_list.append(detections)
 
         return detections_list if len(detections_list) > 1 else detections_list[0]
@@ -710,12 +1052,11 @@ class RFDETR:
         self,
         workspace: str,
         project_id: str,
-        version: str,
-        api_key: Optional[str] = None,
-        size: Optional[str] = None,
+        version: int | str,
+        api_key: str | None = None,
+        size: str | None = None,
     ) -> None:
-        """
-        Deploy the trained RF-DETR model to Roboflow.
+        """Deploy the trained RF-DETR model to Roboflow.
 
         Deploying with Roboflow will create a Serverless API to which you can make requests.
 
@@ -735,6 +1076,7 @@ class RFDETR:
             ValueError: If the `api_key` is not provided and not found in the
                 environment variable `ROBOFLOW_API_KEY`, or if the `size` is
                 not set for custom architectures.
+
         """
         import shutil
 
@@ -754,203 +1096,42 @@ class RFDETR:
         size = self.size or size
         tmp_out_dir = ".roboflow_temp_upload"
         os.makedirs(tmp_out_dir, exist_ok=True)
-        outpath = os.path.join(tmp_out_dir, "weights.pt")
-        torch.save({"model": self.model.model.state_dict(), "args": self.model.args}, outpath)
-        project = workspace.project(project_id)
-        version = project.version(version)
-        version.deploy(model_type=size, model_path=tmp_out_dir, filename="weights.pt")
-        shutil.rmtree(tmp_out_dir)
-
-
-class RFDETRBase(RFDETR):
-    """
-    Train an RF-DETR Base model (29M parameters).
-    """
-
-    size = "rfdetr-base"
-
-    def get_model_config(self, **kwargs):
-        return RFDETRBaseConfig(**kwargs)
-
-    def get_train_config(self, **kwargs):
-        return TrainConfig(**kwargs)
-
-
-class RFDETRNano(RFDETR):
-    """
-    Train an RF-DETR Nano model.
-    """
-
-    size = "rfdetr-nano"
-
-    def get_model_config(self, **kwargs):
-        return RFDETRNanoConfig(**kwargs)
-
-    def get_train_config(self, **kwargs):
-        return TrainConfig(**kwargs)
-
-
-class RFDETRSmall(RFDETR):
-    """
-    Train an RF-DETR Small model.
-    """
-
-    size = "rfdetr-small"
-
-    def get_model_config(self, **kwargs):
-        return RFDETRSmallConfig(**kwargs)
-
-    def get_train_config(self, **kwargs):
-        return TrainConfig(**kwargs)
-
-
-class RFDETRMedium(RFDETR):
-    """
-    Train an RF-DETR Medium model.
-    """
-
-    size = "rfdetr-medium"
-
-    def get_model_config(self, **kwargs):
-        return RFDETRMediumConfig(**kwargs)
-
-    def get_train_config(self, **kwargs):
-        return TrainConfig(**kwargs)
-
-
-class RFDETRLargeNew(RFDETR):
-    size = "rfdetr-large"
-
-    def get_model_config(self, **kwargs):
-        return RFDETRLargeConfig(**kwargs)
-
-    def get_train_config(self, **kwargs):
-        return TrainConfig(**kwargs)
-
-
-class RFDETRLargeDeprecated(RFDETR):
-    """
-    Train an RF-DETR Large model.
-    """
-
-    size = "rfdetr-large"
-
-    def __init__(self, **kwargs):
-        warnings.warn(
-            "RFDETRLargeDeprecated is deprecated and will be removed in a future version."
-            " Please use RFDETRLarge instead.",
-            category=DeprecationWarning,
-            stacklevel=2,
-        )
-        super().__init__(**kwargs)
-
-    def get_model_config(self, **kwargs):
-        return RFDETRLargeDeprecatedConfig(**kwargs)
-
-    def get_train_config(self, **kwargs):
-        return TrainConfig(**kwargs)
-
-
-class RFDETRLarge(RFDETR):
-    size = "rfdetr-large"
-
-    def __init__(self, **kwargs):
-        self.init_error = None
-        self.is_deprecated = False
         try:
-            super().__init__(**kwargs)
-        except Exception as e:
-            self.init_error = e
-            self.is_deprecated = True
-            try:
-                super().__init__(**kwargs)
-                logger.warning(
-                    "\n"
-                    "=" * 100 + "\n"
-                    "WARNING: Automatically switched to deprecated model configuration,"
-                    " due to using deprecated weights."
-                    " This will be removed in a future version.\n"
-                    " Please retrain your model with the new weights and configuration.\n"
-                    "=" * 100 + "\n"
-                )
-            except Exception:
-                raise self.init_error
+            # Write class_names.txt so the Roboflow upload pipeline can discover
+            # the class labels without relying on args.class_names in the checkpoint.
+            class_names_path = os.path.join(tmp_out_dir, "class_names.txt")
+            with open(class_names_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("\n".join(self.class_names))
 
-    def get_model_config(self, **kwargs):
-        if not self.is_deprecated:
-            return RFDETRLargeConfig(**kwargs)
-        else:
-            return RFDETRLargeDeprecatedConfig(**kwargs)
+            # Also embed class_names in the args namespace so that any code path
+            # that loads the checkpoint directly (e.g. roboflow-python's second
+            # fallback) can find them.  Mutating the shared SimpleNamespace is
+            # intentional here: this mirrors reinitialize_detection_head(), which
+            # already mutates args.num_classes in-place.
+            args = self.model.args
+            if not hasattr(args, "class_names") or args.class_names is None:
+                args.class_names = self.class_names
 
-    def get_train_config(self, **kwargs):
-        return TrainConfig(**kwargs)
+            outpath = os.path.join(tmp_out_dir, "weights.pt")
+            torch.save({"model": self.model.model.state_dict(), "args": args}, outpath)
+            project = workspace.project(project_id)
+            project_version = project.version(version)
+            project_version.deploy(model_type=size, model_path=tmp_out_dir, filename="weights.pt")
+        finally:
+            shutil.rmtree(tmp_out_dir, ignore_errors=True)
 
 
-class RFDETRSegPreview(RFDETR):
-    size = "rfdetr-seg-preview"
+def __getattr__(name: str):
+    """Lazily resolve legacy re-exports without creating import-order cycles."""
+    if name in _VARIANT_EXPORTS:
+        module = importlib.import_module("rfdetr.variants")
+        value = getattr(module, name)
+        globals()[name] = value
+        return value
 
-    def get_model_config(self, **kwargs):
-        return RFDETRSegPreviewConfig(**kwargs)
-
-    def get_train_config(self, **kwargs):
-        return SegmentationTrainConfig(**kwargs)
-
-
-class RFDETRSegNano(RFDETR):
-    size = "rfdetr-seg-nano"
-
-    def get_model_config(self, **kwargs):
-        return RFDETRSegNanoConfig(**kwargs)
-
-    def get_train_config(self, **kwargs):
-        return SegmentationTrainConfig(**kwargs)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
-class RFDETRSegSmall(RFDETR):
-    size = "rfdetr-seg-small"
-
-    def get_model_config(self, **kwargs):
-        return RFDETRSegSmallConfig(**kwargs)
-
-    def get_train_config(self, **kwargs):
-        return SegmentationTrainConfig(**kwargs)
-
-
-class RFDETRSegMedium(RFDETR):
-    size = "rfdetr-seg-medium"
-
-    def get_model_config(self, **kwargs):
-        return RFDETRSegMediumConfig(**kwargs)
-
-    def get_train_config(self, **kwargs):
-        return SegmentationTrainConfig(**kwargs)
-
-
-class RFDETRSegLarge(RFDETR):
-    size = "rfdetr-seg-large"
-
-    def get_model_config(self, **kwargs):
-        return RFDETRSegLargeConfig(**kwargs)
-
-    def get_train_config(self, **kwargs):
-        return SegmentationTrainConfig(**kwargs)
-
-
-class RFDETRSegXLarge(RFDETR):
-    size = "rfdetr-seg-xlarge"
-
-    def get_model_config(self, **kwargs):
-        return RFDETRSegXLargeConfig(**kwargs)
-
-    def get_train_config(self, **kwargs):
-        return SegmentationTrainConfig(**kwargs)
-
-
-class RFDETRSeg2XLarge(RFDETR):
-    size = "rfdetr-seg-2xlarge"
-
-    def get_model_config(self, **kwargs):
-        return RFDETRSeg2XLargeConfig(**kwargs)
-
-    def get_train_config(self, **kwargs):
-        return SegmentationTrainConfig(**kwargs)
+def __dir__() -> list[str]:
+    """Include lazy re-exports in interactive discovery."""
+    return sorted(set(globals()) | set(_VARIANT_EXPORTS))

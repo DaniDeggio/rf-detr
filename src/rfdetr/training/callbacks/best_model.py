@@ -14,10 +14,11 @@ from typing import Optional
 
 import torch
 from pytorch_lightning import LightningModule, Trainer
+from pytorch_lightning import __version__ as ptl_version
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 
 from rfdetr.utilities.logger import get_logger
-from rfdetr.utilities.state_dict import strip_checkpoint
+from rfdetr.utilities.state_dict import _make_fit_loop_state, strip_checkpoint
 
 logger = get_logger()
 
@@ -32,6 +33,10 @@ class BestModelCallback(ModelCheckpoint):
     At the end of training the overall winner (regular vs EMA, strict ``>`` for
     EMA) is copied to ``checkpoint_best_total.pth`` and optimizer/scheduler
     state is stripped via :func:`rfdetr.util.misc.strip_checkpoint`.
+
+    Checkpoints are only updated on validation epochs where the monitor metric
+    is actually logged.  On non-eval epochs (when ``eval_interval > 1`` causes
+    COCO evaluation to be skipped) the callback is a no-op.
 
     Args:
         output_dir: Directory where checkpoint files are written.
@@ -57,6 +62,7 @@ class BestModelCallback(ModelCheckpoint):
             monitor=monitor_regular,
             mode="max",
             save_top_k=1,
+            save_on_train_epoch_end=False,
             verbose=False,
             auto_insert_metric_name=False,
             enable_version_counter=False,
@@ -68,8 +74,40 @@ class BestModelCallback(ModelCheckpoint):
         # Stash current pl_module so _save_checkpoint (no pl_module param) can access it.
         self._current_pl_module: Optional[LightningModule] = None
 
+    @staticmethod
+    def _build_checkpoint_payload(
+        model_state_dict: dict[str, torch.Tensor],
+        args_dict: object,
+        trainer: Trainer,
+    ) -> dict[str, object]:
+        """Build a PTL-compatible RF-DETR checkpoint payload.
+
+        Args:
+            model_state_dict: Model weights with raw (non-prefixed) keys.
+            args_dict: Serialized training args/config payload.
+            trainer: Active Lightning trainer providing epoch/step counters.
+
+        Returns:
+            Checkpoint dictionary that supports ``Trainer.fit(ckpt_path=...)``
+            while intentionally omitting optimizer/scheduler states.
+        """
+        return {
+            "model": model_state_dict,
+            "args": args_dict,
+            "epoch": trainer.current_epoch,
+            # PTL-compatible keys so trainer.fit(ckpt_path=...) works directly.
+            "state_dict": {f"model.{k}": v for k, v in model_state_dict.items()},
+            "global_step": trainer.global_step,
+            "pytorch-lightning_version": ptl_version,
+            "loops": {"fit_loop": _make_fit_loop_state(trainer.current_epoch)},
+            # Keep keys present with empty values so PTL resume paths that
+            # expect them can proceed without loading optimizer state.
+            "optimizer_states": [],
+            "lr_schedulers": [],
+        }
+
+    @staticmethod
     def _get_ema_model_state_dict(
-        self,
         trainer: Trainer,
         pl_module: LightningModule,
     ) -> dict[str, torch.Tensor]:
@@ -77,7 +115,7 @@ class BestModelCallback(ModelCheckpoint):
 
         Args:
             trainer: The Lightning Trainer instance.
-            pl_module: The ``RFDETRModule`` being trained.
+            pl_module: The ``RFDETRModelModule`` being trained.
 
         Returns:
             EMA model state dict when available, otherwise the live model state dict.
@@ -127,14 +165,18 @@ class BestModelCallback(ModelCheckpoint):
             _orig = getattr(pl_module.model, "_orig_mod", None)
             raw = _orig if isinstance(_orig, torch.nn.Module) else pl_module.model
             model_state_dict = raw.state_dict()
-        torch.save(
-            {
-                "model": model_state_dict,
-                "args": pl_module.train_config,
-                "epoch": trainer.current_epoch,
-            },
-            pth_path,
-        )
+        # Enrich train_config with dataset class names so reloaded checkpoints
+        # return the correct labels, not COCO defaults (#509).
+        train_config = pl_module.train_config
+        dataset_class_names = getattr(trainer.datamodule, "class_names", None)
+        if (
+            dataset_class_names is not None
+            and hasattr(train_config, "model_copy")
+            and getattr(train_config, "class_names", None) is None
+        ):
+            train_config = train_config.model_copy(update={"class_names": dataset_class_names})
+        args_dict = train_config.model_dump() if hasattr(train_config, "model_dump") else train_config
+        torch.save(self._build_checkpoint_payload(model_state_dict, args_dict, trainer), pth_path)
         self._last_global_step_saved = trainer.global_step
         logger.info("Best regular mAP saved to %s (epoch %d)", pth_path, trainer.current_epoch)
 
@@ -148,10 +190,15 @@ class BestModelCallback(ModelCheckpoint):
 
         Args:
             trainer: The Lightning Trainer instance.
-            pl_module: The ``RFDETRModule`` being trained.
+            pl_module: The ``RFDETRModelModule`` being trained.
         """
         # Stash for use inside _save_checkpoint (which has no pl_module param).
         self._current_pl_module = pl_module
+        # Guard: only run checkpoint logic when the monitored metric was actually
+        # logged this epoch (non-eval epochs with eval_interval > 1 skip COCO eval
+        # so the key is absent from callback_metrics).
+        if self.monitor not in trainer.callback_metrics:
+            return
         super().on_validation_end(trainer, pl_module)
 
         # EMA model — custom tracking on top of parent.
@@ -162,12 +209,21 @@ class BestModelCallback(ModelCheckpoint):
             self._best_ema = ema_val
             self._output_dir.mkdir(parents=True, exist_ok=True)
             ema_state_dict = self._get_ema_model_state_dict(trainer, pl_module)
+            # Enrich train_config with dataset class names so reloaded checkpoints
+            # return the correct labels, not COCO defaults (#509).
+            ema_train_config = pl_module.train_config
+            dataset_class_names = getattr(trainer.datamodule, "class_names", None)
+            if (
+                dataset_class_names is not None
+                and hasattr(ema_train_config, "model_copy")
+                and getattr(ema_train_config, "class_names", None) is None
+            ):
+                ema_train_config = ema_train_config.model_copy(update={"class_names": dataset_class_names})
+            ema_args_dict = (
+                ema_train_config.model_dump() if hasattr(ema_train_config, "model_dump") else ema_train_config
+            )
             torch.save(
-                {
-                    "model": ema_state_dict,
-                    "args": pl_module.train_config,
-                    "epoch": trainer.current_epoch,
-                },
+                self._build_checkpoint_payload(ema_state_dict, ema_args_dict, trainer),
                 self._output_dir / "checkpoint_best_ema.pth",
             )
             logger.info(
@@ -185,7 +241,7 @@ class BestModelCallback(ModelCheckpoint):
 
         Args:
             trainer: The Lightning Trainer instance.
-            pl_module: The ``RFDETRModule`` being trained.
+            pl_module: The ``RFDETRModelModule`` being trained.
         """
         if not trainer.is_global_zero:
             return
@@ -239,6 +295,10 @@ class RFDETREarlyStopping(EarlyStopping):
     checkpoint resumption, NaN/inf guard via ``check_finite``, and
     ``stopping_threshold``/``divergence_threshold``.
 
+    Early stopping evaluates only on validation epochs where the monitored
+    metrics are logged; non-eval epochs (``eval_interval > 1``) are skipped
+    automatically.
+
     Args:
         patience: Number of epochs with no improvement before stopping.
         min_delta: Minimum mAP improvement to reset the patience counter.
@@ -266,6 +326,7 @@ class RFDETREarlyStopping(EarlyStopping):
             mode="max",
             patience=patience,
             min_delta=min_delta,
+            check_on_train_epoch_end=False,
             verbose=verbose,
             check_finite=True,
             strict=False,  # We inject the key ourselves; don't crash if temporarily absent.
@@ -285,7 +346,7 @@ class RFDETREarlyStopping(EarlyStopping):
 
         Args:
             trainer: The Lightning Trainer instance.
-            pl_module: The ``RFDETRModule`` being trained.
+            pl_module: The ``RFDETRModelModule`` being trained.
         """
         metrics = trainer.callback_metrics
         regular_tensor = metrics.get(self._monitor_regular)
