@@ -67,7 +67,7 @@ class PostprocessedExportModule(nn.Module):
 
         # Prepare tensors
         boxes_t = torch.zeros((B, K, 4), dtype=results[0]["boxes"].dtype, device=tensors.device)
-        labels_t = torch.zeros((B, K), dtype=results[0]["labels"].dtype if results[0]["labels"].dtype.is_floating_point else torch.long, device=tensors.device)
+        labels_t = torch.zeros((B, K), dtype=torch.long, device=tensors.device)
         scores_t = torch.zeros((B, K), dtype=results[0]["scores"].dtype, device=tensors.device)
 
         if self.output_mask and ("masks" in results[0]):
