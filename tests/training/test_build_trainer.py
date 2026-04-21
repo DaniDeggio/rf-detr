@@ -84,6 +84,25 @@ class TestBuildTrainerCallbacks:
         assert coco_cb._eval_interval == 3
         assert coco_cb._log_per_class_metrics is False
 
+    def test_eval_only_ema_wires_callbacks_when_ema_enabled(self, tmp_path):
+        """eval_only_ema=True is propagated to both EMA and COCO eval callbacks."""
+        trainer = build_trainer(_tc(tmp_path, use_ema=True, eval_only_ema=True), _mc())
+        coco_cb = next(cb for cb in trainer.callbacks if isinstance(cb, COCOEvalCallback))
+        ema_cb = next(cb for cb in trainer.callbacks if isinstance(cb, RFDETREMACallback))
+        assert coco_cb._eval_only_ema is True
+        assert ema_cb._eval_only_ema is True
+
+    def test_eval_only_ema_is_disabled_when_use_ema_false(self, tmp_path):
+        """eval_only_ema=True has no effect when EMA callback is disabled."""
+        trainer = build_trainer(_tc(tmp_path, use_ema=False, eval_only_ema=True), _mc())
+        coco_cb = next(cb for cb in trainer.callbacks if isinstance(cb, COCOEvalCallback))
+        assert coco_cb._eval_only_ema is False
+
+    def test_eval_only_ema_warns_when_ema_unavailable(self, tmp_path):
+        """eval_only_ema=True emits a warning when EMA validation cannot run."""
+        with pytest.warns(UserWarning, match="eval_only_ema=True ignored"):
+            build_trainer(_tc(tmp_path, use_ema=False, eval_only_ema=True), _mc())
+
     def test_best_model_always_present(self, tmp_path):
         """BestModelCallback is always included."""
         trainer = build_trainer(_tc(tmp_path, use_ema=False), _mc())

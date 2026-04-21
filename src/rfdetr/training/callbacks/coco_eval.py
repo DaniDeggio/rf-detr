@@ -48,6 +48,9 @@ class COCOEvalCallback(Callback):
         eval_interval: Run validation metrics every N epochs. Test metrics are
             always computed when ``trainer.test()`` is called.
         log_per_class_metrics: When ``False``, skip per-class AP logging/table.
+        eval_only_ema: When ``True``, validation runs only EMA weights (via
+            ``RFDETREMACallback`` swapping) and logs EMA-prefixed mAP metrics
+            without duplicate regular ``val/mAP_*`` logger entries.
     """
 
     def __init__(
@@ -56,6 +59,7 @@ class COCOEvalCallback(Callback):
         segmentation: bool = False,
         eval_interval: int = 1,
         log_per_class_metrics: bool = True,
+        eval_only_ema: bool = False,
         in_notebook: bool | None = None,
     ) -> None:
         super().__init__()
@@ -63,6 +67,7 @@ class COCOEvalCallback(Callback):
         self._segmentation = segmentation
         self._eval_interval = max(1, int(eval_interval))
         self._log_per_class_metrics = bool(log_per_class_metrics)
+        self._eval_only_ema = bool(eval_only_ema)
         self._class_names: list[str] = []
         self._cat_id_to_name: dict[int, str] = {}
         self._f1_local: dict[int, dict[str, Any]] = init_matching_accumulator()
@@ -151,7 +156,9 @@ class COCOEvalCallback(Callback):
 
         When an EMA callback is present the EMA model is run on the same batch
         in a separate ``torch.no_grad()`` forward pass so that base and EMA
-        metrics are computed from independent predictions.
+        metrics are computed from independent predictions.  When
+        ``eval_only_ema=True``, the second EMA pass is skipped because EMA
+        weights are already swapped onto the live model for this epoch.
 
         Args:
             trainer: The PTL Trainer.
@@ -168,6 +175,12 @@ class COCOEvalCallback(Callback):
         iou_type = "segm" if self._segmentation else "bbox"
         batch_matching = build_matching_data(preds, targets, iou_threshold=0.5, iou_type=iou_type)
         merge_matching_data(self._f1_local, batch_matching)
+
+        # When eval_only_ema is enabled, RFDETREMACallback swaps EMA weights
+        # onto the live module for the full validation epoch, so this pass is
+        # already EMA and no second forward should run.
+        if self._eval_only_ema:
+            return
 
         # Run EMA model separately on the same batch so that base and EMA metrics
         # are computed from independent forward passes rather than being aliases.
@@ -284,10 +297,12 @@ class COCOEvalCallback(Callback):
             f"mAR @{self._max_dets}": float(metrics[mar_key]),
         }
 
-        pl_module.log(f"{split}/mAP_50_95", metrics[f"{pfx}map"], prog_bar=True)
-        pl_module.log(f"{split}/mAP_50", metrics[f"{pfx}map_50"], prog_bar=True)
-        pl_module.log(f"{split}/mAP_75", metrics[f"{pfx}map_75"])
-        pl_module.log(f"{split}/mAR", metrics[mar_key])
+        is_eval_only_ema_val = self._eval_only_ema and split == "val"
+        if not is_eval_only_ema_val:
+            pl_module.log(f"{split}/mAP_50_95", metrics[f"{pfx}map"], prog_bar=True)
+            pl_module.log(f"{split}/mAP_50", metrics[f"{pfx}map_50"], prog_bar=True)
+            pl_module.log(f"{split}/mAP_75", metrics[f"{pfx}map_75"])
+            pl_module.log(f"{split}/mAR", metrics[mar_key])
 
         # Write directly into callback_metrics so ModelCheckpoint / EarlyStopping
         # read fresh values each epoch.  pl_module.log() from a callback's
@@ -297,6 +312,19 @@ class COCOEvalCallback(Callback):
         trainer.callback_metrics[f"{split}/mAP_50"] = metrics[f"{pfx}map_50"].detach().cpu()
         trainer.callback_metrics[f"{split}/mAP_75"] = metrics[f"{pfx}map_75"].detach().cpu()
         trainer.callback_metrics[f"{split}/mAR"] = metrics[mar_key].detach().cpu()
+
+        if is_eval_only_ema_val:
+            pl_module.log(f"{split}/ema_mAP_50_95", metrics[f"{pfx}map"], prog_bar=True)
+            pl_module.log(f"{split}/ema_mAP_50", metrics[f"{pfx}map_50"])
+            pl_module.log(f"{split}/ema_mAR", metrics[mar_key])
+            trainer.callback_metrics[f"{split}/ema_mAP_50_95"] = metrics[f"{pfx}map"].detach().cpu()
+            trainer.callback_metrics[f"{split}/ema_mAP_50"] = metrics[f"{pfx}map_50"].detach().cpu()
+            trainer.callback_metrics[f"{split}/ema_mAR"] = metrics[mar_key].detach().cpu()
+            if self._segmentation:
+                pl_module.log(f"{split}/ema_segm_mAP_50_95", metrics["segm_map"])
+                pl_module.log(f"{split}/ema_segm_mAP_50", metrics["segm_map_50"])
+                trainer.callback_metrics[f"{split}/ema_segm_mAP_50_95"] = metrics["segm_map"].detach().cpu()
+                trainer.callback_metrics[f"{split}/ema_segm_mAP_50"] = metrics["segm_map_50"].detach().cpu()
 
         # EMA metrics — computed from a separate EMA forward pass accumulated
         # in on_validation_batch_end, so base and EMA values are independent.
@@ -318,8 +346,9 @@ class COCOEvalCallback(Callback):
         if self._segmentation:
             overall["segm mAP 50:95"] = float(metrics["segm_map"])
             overall["segm mAP 50"] = float(metrics["segm_map_50"])
-            pl_module.log(f"{split}/segm_mAP_50_95", metrics["segm_map"])
-            pl_module.log(f"{split}/segm_mAP_50", metrics["segm_map_50"])
+            if not is_eval_only_ema_val:
+                pl_module.log(f"{split}/segm_mAP_50_95", metrics["segm_map"])
+                pl_module.log(f"{split}/segm_mAP_50", metrics["segm_map_50"])
             trainer.callback_metrics[f"{split}/segm_mAP_50_95"] = metrics["segm_map"].detach().cpu()
             trainer.callback_metrics[f"{split}/segm_mAP_50"] = metrics["segm_map_50"].detach().cpu()
 

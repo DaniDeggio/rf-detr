@@ -34,6 +34,8 @@ class RFDETREMACallback(Callback):
             ``TrainConfig.ema_tau``.
         use_buffers: Whether buffers are averaged in addition to parameters.
         update_interval_steps: Update EMA every N optimizer steps.
+        eval_only_ema: When ``True``, swap EMA weights onto the live module
+            for validation epochs so metrics are computed from EMA only.
     """
 
     def __init__(
@@ -42,12 +44,14 @@ class RFDETREMACallback(Callback):
         tau: int = 100,
         use_buffers: bool = True,
         update_interval_steps: int = 1,
+        eval_only_ema: bool = False,
     ) -> None:
         super().__init__()
         self._decay = decay
         self._tau = tau
         self._use_buffers = use_buffers
         self._update_interval_steps = max(1, int(update_interval_steps))
+        self._eval_only_ema = bool(eval_only_ema)
 
         self._average_model: Optional[AveragedModel] = None
         self._latest_update_step = 0
@@ -188,6 +192,16 @@ class RFDETREMACallback(Callback):
     def on_test_epoch_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
         """Restore live weights after test evaluation."""
         self._swap_models(pl_module)
+
+    def on_validation_epoch_start(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        """Optionally evaluate validation using averaged EMA weights only."""
+        if self._eval_only_ema:
+            self._swap_models(pl_module)
+
+    def on_validation_epoch_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
+        """Restore live weights after optional EMA-only validation."""
+        if self._eval_only_ema:
+            self._swap_models(pl_module)
 
     def on_train_end(self, trainer: Trainer, pl_module: LightningModule) -> None:
         """Leave the module in EMA state after training finishes."""

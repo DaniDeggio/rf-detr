@@ -466,6 +466,7 @@ class TrainConfig(BaseModel):
     expanded_scales: bool = True
     do_random_resize_via_padding: bool = False
     use_ema: bool = True
+    eval_only_ema: bool = False
     ema_update_interval: int = 1
     num_workers: int = 2
     weight_decay: float = 1e-4

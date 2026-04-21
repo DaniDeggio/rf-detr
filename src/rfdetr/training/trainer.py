@@ -175,10 +175,18 @@ def build_trainer(
         )
     sharded = any(s in str(strategy).lower() for s in ("fsdp", "deepspeed"))
     enable_ema = bool(tc.use_ema) and not sharded
+    eval_only_ema = bool(tc.eval_only_ema) and enable_ema
     if tc.use_ema and sharded:
         warnings.warn(
             f"EMA disabled: RFDETREMACallback is not compatible with sharded strategies "
             f"(strategy={strategy!r}). Set use_ema=False to suppress this warning.",
+            UserWarning,
+            stacklevel=2,
+        )
+    if tc.eval_only_ema and not eval_only_ema:
+        warnings.warn(
+            "eval_only_ema=True ignored because EMA validation is unavailable. "
+            "Set use_ema=True with a non-sharded strategy to enable EMA-only validation.",
             UserWarning,
             stacklevel=2,
         )
@@ -197,6 +205,7 @@ def build_trainer(
                 decay=tc.ema_decay,
                 tau=tc.ema_tau,
                 update_interval_steps=tc.ema_update_interval,
+                eval_only_ema=eval_only_ema,
             )
         )
 
@@ -211,6 +220,7 @@ def build_trainer(
             segmentation=model_config.segmentation_head,
             eval_interval=tc.eval_interval,
             log_per_class_metrics=tc.log_per_class_metrics,
+            eval_only_ema=eval_only_ema,
         )
     )
 

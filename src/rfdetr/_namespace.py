@@ -88,6 +88,7 @@ _TC_NON_NAMESPACE_FIELDS = {
     "auto_batch_ema_headroom",
     # PTL-only Trainer / DataModule / LR-scheduler knobs.
     "progress_bar",
+    "eval_only_ema",
     "run_test",
     "dont_save_weights",
     "pin_memory",

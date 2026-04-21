@@ -262,6 +262,82 @@ class TestOnTestBatchEnd:
         cb.on_test_batch_end(_make_trainer(), _make_pl_module(), outputs, None, 0, dataloader_idx=0)
 
 
+class TestEvalOnlyEMA:
+    """EMA-only evaluation mode avoids duplicate validation forwards."""
+
+    def test_eval_only_ema_skips_secondary_ema_forward(self) -> None:
+        """When eval_only_ema=True, on_validation_batch_end must not run a second EMA pass."""
+        cb = COCOEvalCallback(eval_only_ema=True)
+        module = _make_pl_module()
+        module.device = torch.device("cpu")
+        cb.setup(_make_trainer(), module, stage="fit")
+        cb.map_metric = MagicMock(name="map_metric")
+        cb.map_metric_ema = MagicMock(name="map_metric_ema")
+
+        ema_model = MagicMock(name="ema_model")
+        ema_model.eval.return_value = None
+        ema_model.return_value = {"pred_logits": torch.randn(1, 3, 2), "pred_boxes": torch.rand(1, 3, 4)}
+        ema_cb = MagicMock(name="ema_cb")
+        ema_cb._average_model = MagicMock()
+        ema_cb._average_model.module.model = ema_model
+        trainer = _make_trainer(callbacks=[ema_cb])
+
+        outputs = {
+            "results": _detection_preds(1),
+            "targets": _detection_targets(),
+        }
+        batch = (MagicMock(name="samples"), outputs["targets"])
+
+        cb.on_validation_batch_end(trainer, module, outputs, batch, 0)
+
+        cb.map_metric.update.assert_called_once()
+        cb.map_metric_ema.update.assert_not_called()
+        ema_model.assert_not_called()
+
+    def test_eval_only_ema_logs_ema_aliases_from_primary_metrics(self) -> None:
+        """When eval_only_ema=True, val/ema_* keys are emitted from the single metrics pass."""
+        cb = COCOEvalCallback(max_dets=500, eval_only_ema=True)
+        trainer = _make_trainer()
+        trainer.callback_metrics = {}
+        cb.setup(trainer, _make_pl_module(), stage="fit")
+        cb.map_metric = MagicMock(name="map_metric")
+        cb.map_metric.compute.return_value = _minimal_metrics()
+        module = _make_pl_module()
+
+        cb.on_validation_epoch_end(trainer, module)
+
+        logged_keys = {c.args[0] for c in module.log.call_args_list}
+        assert "val/ema_mAP_50_95" in logged_keys
+        assert "val/ema_mAP_50" in logged_keys
+        assert "val/ema_mAR" in logged_keys
+        assert "val/mAP_50_95" not in logged_keys
+        assert "val/mAP_50" not in logged_keys
+        assert trainer.callback_metrics["val/ema_mAP_50_95"].item() == pytest.approx(0.4)
+
+    def test_eval_only_ema_segm_aliases_follow_base_segm_values(self) -> None:
+        """Segmentation EMA aliases are copied from the single pass in eval_only_ema mode."""
+        cb = COCOEvalCallback(max_dets=500, segmentation=True, eval_only_ema=True)
+        trainer = _make_trainer()
+        trainer.callback_metrics = {}
+        cb.setup(trainer, _make_pl_module(), stage="fit")
+        cb.map_metric = MagicMock(name="map_metric")
+        segm_metrics = _minimal_metrics(pfx="bbox_")
+        segm_metrics["segm_map"] = torch.tensor(0.35)
+        segm_metrics["segm_map_50"] = torch.tensor(0.55)
+        cb.map_metric.compute.return_value = segm_metrics
+        module = _make_pl_module()
+
+        cb.on_validation_epoch_end(trainer, module)
+
+        logged_keys = {c.args[0] for c in module.log.call_args_list}
+        assert "val/segm_mAP_50_95" not in logged_keys
+        assert "val/segm_mAP_50" not in logged_keys
+        assert "val/ema_segm_mAP_50_95" in logged_keys
+        assert "val/ema_segm_mAP_50" in logged_keys
+        assert trainer.callback_metrics["val/ema_segm_mAP_50_95"].item() == pytest.approx(0.35)
+        assert trainer.callback_metrics["val/ema_segm_mAP_50"].item() == pytest.approx(0.55)
+
+
 @pytest.mark.parametrize(
     "stage,hook,prefix",
     [

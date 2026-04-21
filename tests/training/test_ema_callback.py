@@ -201,3 +201,31 @@ class TestLegacyEMAResume:
         for key, expected in legacy_ema_state.items():
             assert torch.allclose(restored[key], expected)
         assert not hasattr(pl_module, "_pending_legacy_ema_state")
+
+
+class TestEvalOnlyEMAValidationSwap:
+    """Validation swap-in/out behavior for eval_only_ema mode."""
+
+    def test_validation_epoch_hooks_swap_when_eval_only_ema_enabled(self) -> None:
+        """Validation hooks must call _swap_models when eval_only_ema=True."""
+        cb = RFDETREMACallback(eval_only_ema=True)
+        trainer = MagicMock()
+        pl_module = MagicMock()
+        cb._swap_models = MagicMock()
+
+        cb.on_validation_epoch_start(trainer, pl_module)
+        cb.on_validation_epoch_end(trainer, pl_module)
+
+        assert cb._swap_models.call_count == 2
+
+    def test_validation_epoch_hooks_do_not_swap_when_eval_only_ema_disabled(self) -> None:
+        """Validation hooks must no-op when eval_only_ema=False."""
+        cb = RFDETREMACallback(eval_only_ema=False)
+        trainer = MagicMock()
+        pl_module = MagicMock()
+        cb._swap_models = MagicMock()
+
+        cb.on_validation_epoch_start(trainer, pl_module)
+        cb.on_validation_epoch_end(trainer, pl_module)
+
+        cb._swap_models.assert_not_called()
