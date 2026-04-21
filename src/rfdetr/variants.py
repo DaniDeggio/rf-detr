@@ -30,8 +30,6 @@ __all__ = [
     "RFDETRSeg2XLarge",
 ]
 
-import warnings
-
 from deprecate import deprecated_class
 
 from rfdetr.config import (
@@ -63,12 +61,7 @@ logger = get_logger()
     remove_in="2.0.0",
 )
 class RFDETRBase(RFDETR):
-    """RF-DETR Base model — deprecated since v1.7.0.
-
-    .. deprecated:: 1.7.0
-        Use one of the supported variants: :class:`RFDETRNano`, :class:`RFDETRSmall`,
-        :class:`RFDETRMedium`, or :class:`RFDETRLarge`.
-    """
+    """RF-DETR Base model — deprecated in v1.7.0, scheduled for removal in v2.0.0."""
 
     size = "rfdetr-base"
     _model_config_class = RFDETRBaseConfig
@@ -101,22 +94,16 @@ class RFDETRMedium(RFDETR):
     _model_config_class = RFDETRMediumConfig
 
 
+@deprecated_class(
+    target=None,
+    deprecated_in="1.7.0",
+    remove_in="2.0.0",
+)
 class RFDETRLargeDeprecated(RFDETR):
-    """
-    Train an RF-DETR Large model.
-    """
+    """RF-DETR Large model (legacy config) — deprecated in v1.7.0, scheduled for removal in v2.0.0."""
 
     size = "rfdetr-large"
     _model_config_class = RFDETRLargeDeprecatedConfig
-
-    def __init__(self, **kwargs):
-        warnings.warn(
-            "RFDETRLargeDeprecated is deprecated and will be removed in a future version."
-            " Please use RFDETRLarge instead.",
-            category=DeprecationWarning,
-            stacklevel=2,
-        )
-        super().__init__(**kwargs)
 
 
 class RFDETRLarge(RFDETR):
@@ -154,10 +141,18 @@ class RFDETRLarge(RFDETR):
     def __init__(self, **kwargs):
         self.init_error = None
         self.is_deprecated = False
+        # When the user explicitly sets a custom resolution, a PE size mismatch
+        # is caused by the resolution change — not by deprecated weights.  Guard
+        # against the fallback heuristic misclassifying it as deprecated weights.
+        # Only suppress the fallback when the provided resolution genuinely differs
+        # from the class default; passing resolution=<default> explicitly (e.g. from
+        # a serialised config round-trip) must still allow the deprecated-weights retry.
+        _default_resolution = RFDETRLargeConfig.model_fields["resolution"].default
+        _custom_resolution = "resolution" in kwargs and kwargs.get("resolution") != _default_resolution
         try:
             super().__init__(**kwargs)
         except (ValueError, RuntimeError) as exc:
-            if not self._should_fallback_to_deprecated_config(exc):
+            if _custom_resolution or not self._should_fallback_to_deprecated_config(exc):
                 raise
             self.init_error = exc
             self.is_deprecated = True
@@ -172,8 +167,15 @@ class RFDETRLarge(RFDETR):
                     " Please retrain your model with the new weights and configuration.\n"
                     "=" * 100 + "\n"
                 )
-            except Exception:
-                raise self.init_error
+            except Exception as retry_exc:
+                logger.exception(
+                    "Retry with deprecated RF-DETR Large configuration failed; "
+                    "re-raising the original initialization error for compatibility. "
+                    "Original error: %s",
+                    self.init_error,
+                    exc_info=retry_exc,
+                )
+                raise self.init_error from None
 
     def get_model_config(self, **kwargs) -> ModelConfig:
         if not self.is_deprecated:
@@ -194,12 +196,7 @@ class RFDETRSeg(RFDETR):
     remove_in="2.0.0",
 )
 class RFDETRSegPreview(RFDETRSeg):
-    """RF-DETR Segmentation Preview model — deprecated since v1.7.0.
-
-    .. deprecated:: 1.7.0
-        Use one of the supported segmentation variants: :class:`RFDETRSegNano`, :class:`RFDETRSegSmall`,
-        :class:`RFDETRSegMedium`, or :class:`RFDETRSegLarge`.
-    """
+    """RF-DETR Segmentation Preview model — deprecated in v1.7.0, scheduled for removal in v2.0.0."""
 
     size = "rfdetr-seg-preview"
     _model_config_class = RFDETRSegPreviewConfig

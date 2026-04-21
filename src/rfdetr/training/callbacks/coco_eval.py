@@ -11,7 +11,7 @@ from typing import Any
 
 import numpy as np
 import torch
-import torch.nn.functional as F
+import torch.nn.functional as F  # noqa: N812
 from pytorch_lightning import Callback
 from torchmetrics.detection import MeanAveragePrecision
 
@@ -261,7 +261,10 @@ class COCOEvalCallback(Callback):
 
         Computes mAP (via ``self.map_metric``), runs the F1 confidence-threshold
         sweep, logs all scalar metrics via ``pl_module.log``, prints two summary
-        tables to the terminal, and resets internal accumulators.
+        tables to the terminal, and resets internal accumulators.  When
+        ``self.map_metric_ema`` is set, EMA variants of all metrics (including
+        ``ema_segm_mAP_50_95`` and ``ema_segm_mAP_50`` for segmentation models)
+        are logged under the same ``split/`` namespace.
 
         Args:
             trainer: The PTL Trainer.
@@ -299,13 +302,17 @@ class COCOEvalCallback(Callback):
         # in on_validation_batch_end, so base and EMA values are independent.
         if self.map_metric_ema is not None:
             ema_metrics = self.map_metric_ema.compute()
-            ema_mar_key = f"{pfx}mar_{self._max_dets}"
             pl_module.log(f"{split}/ema_mAP_50_95", ema_metrics[f"{pfx}map"], prog_bar=True)
             pl_module.log(f"{split}/ema_mAP_50", ema_metrics[f"{pfx}map_50"])
-            pl_module.log(f"{split}/ema_mAR", ema_metrics[ema_mar_key])
+            pl_module.log(f"{split}/ema_mAR", ema_metrics[mar_key])
             trainer.callback_metrics[f"{split}/ema_mAP_50_95"] = ema_metrics[f"{pfx}map"].detach().cpu()
             trainer.callback_metrics[f"{split}/ema_mAP_50"] = ema_metrics[f"{pfx}map_50"].detach().cpu()
-            trainer.callback_metrics[f"{split}/ema_mAR"] = ema_metrics[ema_mar_key].detach().cpu()
+            trainer.callback_metrics[f"{split}/ema_mAR"] = ema_metrics[mar_key].detach().cpu()
+            if self._segmentation:
+                pl_module.log(f"{split}/ema_segm_mAP_50_95", ema_metrics["segm_map"])
+                pl_module.log(f"{split}/ema_segm_mAP_50", ema_metrics["segm_map_50"])
+                trainer.callback_metrics[f"{split}/ema_segm_mAP_50_95"] = ema_metrics["segm_map"].detach().cpu()
+                trainer.callback_metrics[f"{split}/ema_segm_mAP_50"] = ema_metrics["segm_map_50"].detach().cpu()
             self.map_metric_ema.reset()
 
         if self._segmentation:
@@ -315,11 +322,6 @@ class COCOEvalCallback(Callback):
             pl_module.log(f"{split}/segm_mAP_50", metrics["segm_map_50"])
             trainer.callback_metrics[f"{split}/segm_mAP_50_95"] = metrics["segm_map"].detach().cpu()
             trainer.callback_metrics[f"{split}/segm_mAP_50"] = metrics["segm_map_50"].detach().cpu()
-            if self._has_ema_callback(trainer):
-                pl_module.log(f"{split}/ema_segm_mAP_50_95", metrics["segm_map"])
-                pl_module.log(f"{split}/ema_segm_mAP_50", metrics["segm_map_50"])
-                trainer.callback_metrics[f"{split}/ema_segm_mAP_50_95"] = metrics["segm_map"].detach().cpu()
-                trainer.callback_metrics[f"{split}/ema_segm_mAP_50"] = metrics["segm_map_50"].detach().cpu()
 
         # F1 sweep — run first so per-class F1/prec/rec are available when
         # building the unified per-class table rows below.
@@ -385,10 +387,6 @@ class COCOEvalCallback(Callback):
         self._print_metrics_tables(trainer, split, overall, per_class)
         self.map_metric.reset()
         self._f1_local = init_matching_accumulator()
-
-    def _has_ema_callback(self, trainer: Any) -> bool:
-        """Return whether an EMA callback is present in the Trainer."""
-        return self._get_ema_callback(trainer) is not None
 
     def _get_ema_callback(self, trainer: Any) -> Any:
         """Return the EMA callback instance, or ``None`` if not present."""
@@ -626,15 +624,17 @@ class COCOEvalCallback(Callback):
             return sum(widths[start : end + 1]) + (end - start)
 
         # Box-drawing character sets
-        BH, BL = "━", "─"
-        VH, VL = "┃", "│"
-        TL, TR = "┏", "┓"
-        T_DN = "┳"  # heavy T-down: top-border internal group separator
-        TR_L, TR_R = "┡", "┩"  # transition-row left/right edges
-        GRP_J = "╇"  # transition-row at group boundary: heavy-up, heavy-horiz, light-down
-        SUB_J = "┯"  # transition-row within group: no-up, heavy-horiz, light-down
-        ML, MR, MX = "├", "┤", "┼"
-        BL_C, BR_C, BT = "└", "┘", "┴"
+        heavy_horizontal = "━"
+        light_horizontal = "─"
+        heavy_vertical = "┃"
+        light_vertical = "│"
+        top_left_corner, top_right_corner = "┏", "┓"
+        top_t_down = "┳"  # heavy T-down: top-border internal group separator
+        transition_left, transition_right = "┡", "┩"  # transition-row left/right edges
+        group_join = "╇"  # transition-row at group boundary: heavy-up, heavy-horiz, light-down
+        subgroup_join = "┯"  # transition-row within group: no-up, heavy-horiz, light-down
+        mid_left, mid_right, mid_cross = "├", "┤", "┼"
+        bottom_left_corner, bottom_right_corner, bottom_t_up = "└", "┘", "┴"
 
         # Title (centred over the full table width)
         inner_w = sum(widths) + n - 1
@@ -642,45 +642,45 @@ class COCOEvalCallback(Callback):
         title_line = title.center(inner_w + 2)
 
         # Row 1: top border — group-level separators only
-        r1 = TL
+        r1 = top_left_corner
         for i, (s, e, _) in enumerate(spans):
-            r1 += BH * grp_w(s, e)
-            r1 += T_DN if i < len(spans) - 1 else TR
+            r1 += heavy_horizontal * grp_w(s, e)
+            r1 += top_t_down if i < len(spans) - 1 else top_right_corner
 
         # Row 2: group labels centred in merged cells
-        r2 = VH
+        r2 = heavy_vertical
         for s, e, grp in spans:
-            r2 += grp.center(grp_w(s, e)) + VH
+            r2 += grp.center(grp_w(s, e)) + heavy_vertical
 
         # Row 3: transition row — heavy horizontal; ╇ at group ends, ┯ within groups
-        r3 = TR_L
+        r3 = transition_left
         for i, w in enumerate(widths):
-            r3 += BH * w
+            r3 += heavy_horizontal * w
             if i < n - 1:
-                r3 += GRP_J if i in grp_ends else SUB_J
-        r3 += TR_R
+                r3 += group_join if i in grp_ends else subgroup_join
+        r3 += transition_right
 
         # Row 4: sub-labels with light borders
-        r4 = VL
+        r4 = light_vertical
         for i, (sub, _) in enumerate(flat):
-            r4 += sub.center(widths[i]) + VL
+            r4 += sub.center(widths[i]) + light_vertical
 
         # Row 5: light separator between sub-labels and values
-        r5 = ML
+        r5 = mid_left
         for i, w in enumerate(widths):
-            r5 += BL * w
-            r5 += MX if i < n - 1 else MR
+            r5 += light_horizontal * w
+            r5 += mid_cross if i < n - 1 else mid_right
 
         # Row 6: values
-        r6 = VL
+        r6 = light_vertical
         for i, (_, val) in enumerate(flat):
-            r6 += val.center(widths[i]) + VL
+            r6 += val.center(widths[i]) + light_vertical
 
         # Row 7: bottom border
-        r7 = BL_C
+        r7 = bottom_left_corner
         for i, w in enumerate(widths):
-            r7 += BL * w
-            r7 += BT if i < n - 1 else BR_C
+            r7 += light_horizontal * w
+            r7 += bottom_t_up if i < n - 1 else bottom_right_corner
 
         return "\n".join([title_line, r1, r2, r3, r4, r5, r6, r7])
 

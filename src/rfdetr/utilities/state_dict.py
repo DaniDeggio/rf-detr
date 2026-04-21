@@ -27,6 +27,24 @@ _PTL_COMPAT_KEYS = (
 )
 
 
+def _raise_patch_size_mismatch(ckpt_patch_size: int, model_patch_size: int) -> None:
+    """Raise a descriptive ValueError for a patch_size incompatibility.
+
+    Args:
+        ckpt_patch_size: patch_size recorded in (or inferred from) the checkpoint.
+        model_patch_size: patch_size the current model is configured with.
+
+    Raises:
+        ValueError: Always — describes the mismatch and how to resolve it.
+    """
+    raise ValueError(
+        f"The checkpoint was trained with patch_size={ckpt_patch_size}, but the current model uses "
+        f"patch_size={model_patch_size}. The checkpoint is incompatible with this model architecture. "
+        "To resolve this, either instantiate/configure the model with the checkpoint's patch_size or "
+        "use a checkpoint that was trained with the same patch_size as the current model."
+    )
+
+
 def _ckpt_args_get(args: Any, field: str, default: Any = None) -> Any:
     """Get a field from checkpoint ``"args"``, handling both dict and attribute access.
 
@@ -120,7 +138,11 @@ def _make_fit_loop_state(epoch: int) -> dict:
 def strip_checkpoint(checkpoint: str | os.PathLike[str]) -> None:
     """Strip a checkpoint file down to ``model``, ``args``, and PTL-compatible keys.
 
-    Preserves ``state_dict``, ``global_step``, ``pytorch-lightning_version``,
+    Preserves ``model_name`` (when present) so that ``RFDETR.from_checkpoint()``
+    can still resolve the model class from the stripped file.  Also preserves
+    ``rfdetr_version`` (when present) for provenance tracking.
+
+    Also preserves ``state_dict``, ``global_step``, ``pytorch-lightning_version``,
     ``loops``, ``optimizer_states``, and ``lr_schedulers`` when present so the
     stripped checkpoint can still be used directly with
     ``trainer.fit(ckpt_path=...)``.
@@ -141,6 +163,12 @@ def strip_checkpoint(checkpoint: str | os.PathLike[str]) -> None:
         "model": state_dict["model"],
         "args": state_dict["args"],
     }
+    # Preserve model_name when present (#887).
+    if "model_name" in state_dict:
+        new_state_dict["model_name"] = state_dict["model_name"]
+    # Preserve rfdetr_version when present for provenance tracking.
+    if "rfdetr_version" in state_dict:
+        new_state_dict["rfdetr_version"] = state_dict["rfdetr_version"]
     # Preserve PTL-compatible keys when present (written by BestModelCallback).
     for key in _PTL_COMPAT_KEYS:
         if key in state_dict:
@@ -198,14 +226,25 @@ def validate_checkpoint_compatibility(checkpoint: dict[str, Any], model_args: An
 
     Raises:
         ValueError: If ``segmentation_head`` or ``patch_size`` in the checkpoint
-            args do not match those of the model.
+            args do not match those of the model, or if the ``patch_size`` inferred
+            from the DINOv2 projection weight shape differs from
+            ``model_args.patch_size`` when no explicit ``args.patch_size`` is present.
 
     Note:
         This helper does not mutate ``model_args``. It emits ``logger.warning``
         (not an exception) for class-count mismatches so that callers can still
         proceed with reinitialization or weight loading.
 
-        Two scenarios are distinguished:
+        When ``"args"`` is absent or ``args.patch_size`` is not set, a fallback
+        infers ``patch_size`` from the DINOv2 patch-embedding projection weight
+        shape (key ``backbone.0.encoder.encoder.embeddings.patch_embeddings.projection.weight``).
+        This fallback **can raise** :class:`ValueError` on a mismatch, providing a
+        clear error before the cryptic :class:`RuntimeError` from
+        :meth:`~torch.nn.Module.load_state_dict` would otherwise fire.
+        For all other attributes (e.g. ``segmentation_head``), if either side is
+        missing, that check is skipped silently — preserving backward compatibility.
+
+        Two class-count scenarios are distinguished:
 
         * Backbone pretrain: the checkpoint head was trained with more classes
           than the current ``model_args.num_classes``. In this case the detection
@@ -245,6 +284,28 @@ def validate_checkpoint_compatibility(checkpoint: dict[str, Any], model_args: An
                     ckpt_num_classes - 1,
                 )
 
+    # Infer patch_size from the patch-embedding projection weight only as a fallback
+    # when the checkpoint has no explicit args.patch_size (e.g., COCO pretrained
+    # release weights that only store "model").
+    # Conv2d projection shape is [out_channels, in_channels, kernel_h, kernel_w];
+    # kernel_h == patch_size for square kernels. Raises before load_state_dict fires,
+    # replacing the otherwise-cryptic "size mismatch" RuntimeError. Regression: #965.
+    # NOTE: key path is DINOv2-specific; non-DINOv2 backbones simply won't have this key
+    # and the check is silently skipped, preserving backward compatibility.
+    _ckpt_args = checkpoint.get("args")
+    _ckpt_patch_size_from_args: int | None = None
+    if _ckpt_args is not None:
+        _ckpt_patch_size_from_args = _ckpt_args_get(_ckpt_args, "patch_size")
+
+    if _ckpt_patch_size_from_args is None:
+        _patch_proj_key = "backbone.0.encoder.encoder.embeddings.patch_embeddings.projection.weight"
+        _ckpt_proj_w = checkpoint.get("model", {}).get(_patch_proj_key)
+        _ckpt_proj_shape = getattr(_ckpt_proj_w, "shape", None)
+        if _ckpt_proj_shape is not None and len(_ckpt_proj_shape) == 4 and _ckpt_proj_shape[2] == _ckpt_proj_shape[3]:
+            _inferred_ps = int(_ckpt_proj_shape[-1])
+            _model_ps: int | None = getattr(model_args, "patch_size", None)
+            if _model_ps is not None and _inferred_ps != _model_ps:
+                _raise_patch_size_mismatch(_inferred_ps, _model_ps)
     if "args" not in checkpoint:
         return
 
@@ -252,25 +313,23 @@ def validate_checkpoint_compatibility(checkpoint: dict[str, Any], model_args: An
     ckpt_segmentation_head: bool | None = _ckpt_args_get(ckpt_args, "segmentation_head")
     model_segmentation_head: bool | None = getattr(model_args, "segmentation_head", None)
 
-    if ckpt_segmentation_head is not None and model_segmentation_head is not None:
-        if ckpt_segmentation_head != model_segmentation_head:
-            if ckpt_segmentation_head:
-                raise ValueError(
-                    "The checkpoint was trained with a segmentation head, but the current model does not have one. "
-                    "Load the weights into a segmentation model (e.g. RFDETRSegNano) instead of a detection model."
-                )
-            else:
-                raise ValueError(
-                    "The current model has a segmentation head, but the checkpoint was trained without one. "
-                    "Load the weights into a detection model (e.g. RFDETRNano) instead of a segmentation model."
-                )
+    if (
+        ckpt_segmentation_head is not None
+        and model_segmentation_head is not None
+        and ckpt_segmentation_head != model_segmentation_head
+    ):
+        if ckpt_segmentation_head:
+            raise ValueError(
+                "The checkpoint was trained with a segmentation head, but the current model does not have one. "
+                "Load the weights into a segmentation model (e.g. RFDETRSegNano) instead of a detection model."
+            )
+        else:
+            raise ValueError(
+                "The current model has a segmentation head, but the checkpoint was trained without one. "
+                "Load the weights into a detection model (e.g. RFDETRNano) instead of a segmentation model."
+            )
 
     ckpt_patch_size: int | None = _ckpt_args_get(ckpt_args, "patch_size")
     model_patch_size: int | None = getattr(model_args, "patch_size", None)
     if ckpt_patch_size is not None and model_patch_size is not None and ckpt_patch_size != model_patch_size:
-        raise ValueError(
-            f"The checkpoint was trained with patch_size={ckpt_patch_size}, but the current model uses "
-            f"patch_size={model_patch_size}. The checkpoint is incompatible with this model architecture. "
-            "To resolve this, either instantiate/configure the model with the checkpoint's patch_size or "
-            "use a checkpoint that was trained with the same patch_size as the current model."
-        )
+        _raise_patch_size_mismatch(ckpt_patch_size, model_patch_size)
