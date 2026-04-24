@@ -7,10 +7,12 @@
 
 import os
 import warnings
-from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, Union
+from typing import Any, ClassVar, Dict, List, Literal, Mapping, Optional, TypeAlias, Union
 
 import torch
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+EncoderName: TypeAlias = Literal["dinov2_windowed_small", "dinov2_windowed_base", "dinov2_registers_windowed_small"]
 
 
 def _detect_device() -> str:
@@ -77,7 +79,7 @@ class BaseConfig(BaseModel):
 
 
 class ModelConfig(BaseConfig):
-    encoder: Literal["dinov2_windowed_small", "dinov2_windowed_base"]
+    encoder: EncoderName
     out_feature_indexes: List[int]
     dec_layers: int
     two_stage: bool = True
@@ -97,6 +99,7 @@ class ModelConfig(BaseConfig):
     lite_refpoint_refine: bool = True
     layer_norm: bool = True
     amp: bool = True
+    num_channels: int = Field(default=3, ge=1)
     num_classes: int = 90
     pretrain_weights: Optional[str] = None
     # torch.device values are accepted at validation time and normalized to string.
@@ -225,7 +228,7 @@ class RFDETRBaseConfig(ModelConfig):
     The configuration for an RF-DETR Base model.
     """
 
-    encoder: Literal["dinov2_windowed_small", "dinov2_windowed_base"] = "dinov2_windowed_small"
+    encoder: EncoderName = "dinov2_windowed_small"
     hidden_dim: int = 256
     patch_size: int = 14
     num_windows: int = 4
@@ -247,7 +250,7 @@ class RFDETRLargeDeprecatedConfig(RFDETRBaseConfig):
     The configuration for an RF-DETR Large model.
     """
 
-    encoder: Literal["dinov2_windowed_small", "dinov2_windowed_base"] = "dinov2_windowed_base"
+    encoder: EncoderName = "dinov2_windowed_base"
     hidden_dim: int = 384
     sa_nheads: int = 12
     ca_nheads: int = 24

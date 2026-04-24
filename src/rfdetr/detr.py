@@ -223,6 +223,13 @@ class RFDETR:
         self.model = self.get_model(self.model_config)
         self.callbacks = defaultdict(list)
 
+        # repeat means and stds for non-rgb images
+        if self.model_config.num_channels != 3:
+            from itertools import cycle
+
+            self.means = [val for _, val in zip(range(self.model_config.num_channels), cycle(self.means))]
+            self.stds = [val for _, val in zip(range(self.model_config.num_channels), cycle(self.stds))]
+
         self.model.inference_model = None
         self._is_optimized_for_inference = False
         self._has_warned_about_not_being_optimized_for_inference = False
@@ -709,7 +716,7 @@ class RFDETR:
                         self.model.inference_model,
                         torch.randn(
                             batch_size,
-                            3,
+                            self.model_config.num_channels,
                             self.model.resolution,
                             self.model.resolution,
                             device=self.model.device,
@@ -866,7 +873,9 @@ class RFDETR:
             else:
                 shape = _validate_shape_dims(shape, block_size, patch_size, num_windows)
 
-            input_tensors = make_infer_image(infer_dir, shape, batch_size, device).to(device)
+            input_tensors = make_infer_image(
+                infer_dir, shape, batch_size, device, num_channels=self.model_config.num_channels
+            ).to(device)
             input_names = ["input"]
             if backbone_only:
                 output_names = ["features"]
@@ -1120,7 +1129,7 @@ class RFDETR:
         shape: tuple[int, int] | None = None,
         patch_size: int | None = None,
         include_source_image: bool = True,
-        **kwargs,
+        **kwargs: Any,
     ) -> sv.Detections | list[sv.Detections]:
         """Performs object detection on the input images and returns bounding box
         predictions.
@@ -1161,34 +1170,16 @@ class RFDETR:
 
         Returns:
             A single or multiple Detections objects, each containing bounding box
-            coordinates, confidence scores, and class IDs.  The ``data`` dict of
-            each :class:`~supervision.Detections` object contains:
-
-            * ``"class_name"`` – ``np.ndarray`` of string class names corresponding
-              to each detection (``class_names[class_id]``).  Class IDs are always
-              0-indexed; ``class_names[0]`` is the first class regardless of the
-              original dataset format (COCO category IDs are remapped to 0-based
-              indices during training).
-            * ``"source_shape"`` – ``np.ndarray`` of shape ``(N, 2)`` and dtype
-              ``int64``, where each row is ``[height, width]`` of the source image.
-              ``N`` equals the number of detections (0 when threshold filters all
-              results) so that iteration over ``sv.Detections`` works correctly.
-              Stored in ``data`` (not ``metadata``) because each row maps to exactly
-              one detection, so supervision's per-detection indexing works correctly.
-              Changed: this was previously a ``(height, width)`` Python ``tuple``;
-              callers using ``isinstance(v, tuple)`` or ``v == (H, W)`` must be
-              updated.
-
-            The ``metadata`` dict of each :class:`~supervision.Detections` object
-            contains:
-
-            * ``"source_image"`` – the original input image as a ``uint8`` numpy
-              array of shape ``(H, W, 3)`` (only present when
-              ``include_source_image=True``, which is the default).  Stored in
-              ``metadata`` rather than ``data`` so that boolean and integer indexing
-              of :class:`~supervision.Detections` works correctly — supervision
-              indexes every value in ``data`` by the detection mask, but passes
-              ``metadata`` through unchanged.
+            coordinates, confidence scores, and class IDs. The ``data`` dict of
+            each :class:`~supervision.Detections` object contains ``class_name``
+            as a string array corresponding to each detection and ``source_shape``
+            as an ``int64`` array of shape ``(N, 2)`` with ``[height, width]`` rows.
+            ``source_shape`` is stored per detection so supervision indexing works
+            correctly. It was previously a ``(height, width)`` Python ``tuple``;
+            callers using ``isinstance(v, tuple)`` or ``v == (H, W)`` must be
+            updated. The ``metadata`` dict contains ``source_image`` as the original
+            ``uint8`` image array of shape ``(H, W, 3)`` when
+            ``include_source_image=True``.
 
         Raises:
             ValueError: If ``shape`` cannot be unpacked as a two-element sequence,
@@ -1260,8 +1251,12 @@ class RFDETR:
                 raise ValueError(
                     "Image has pixel values below 0. Please ensure the image is normalized (scaled to [0, 1]).",
                 )
-            if img.shape[0] != 3:
-                raise ValueError(f"Invalid image shape. Expected 3 channels (RGB), but got {img.shape[0]} channels.")
+            if img.shape[0] != self.model_config.num_channels:
+                raise ValueError(
+                    "Invalid tensor image shape. Tensor inputs to `predict()` must be in (C, H, W) format "
+                    f"with C matching the model configuration ({self.model_config.num_channels} channels). "
+                    f"Received tensor with shape {tuple(img.shape)}."
+                )
             img_tensor = img
 
             h, w = img_tensor.shape[1:]

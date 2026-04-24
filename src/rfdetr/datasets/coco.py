@@ -325,6 +325,10 @@ def _build_train_resize_config(
     - **Option B** – resize to an intermediate scale (400/500/600 px), crop,
       then resize to the target scale.
 
+    Divisibility padding (rounding ``H``/``W`` up to a multiple of
+    ``patch_size * num_windows``) is handled by the batch collator via
+    :func:`~rfdetr.utilities.tensors.make_collate_fn`, not here.
+
     Args:
         scales: Target resize scales in pixels.
         square: If ``True``, produce square output using ``A.Resize``
@@ -439,6 +443,15 @@ def make_coco_transforms(
     Returns:
         A :class:`torchvision.transforms.v2.Compose` pipeline ready to be passed
         to :class:`CocoDetection`.
+
+        .. note::
+            This pipeline does **not** guarantee that output ``H`` and ``W`` are
+            divisible by ``patch_size * num_windows``.  Divisibility is enforced
+            at the batch level by the DataLoader collate function.  If you apply
+            these transforms outside of :class:`~rfdetr.training.module_data.RFDETRDataModule`,
+            pass the result through :func:`~rfdetr.utilities.tensors.nested_tensor_from_tensor_list`
+            with ``block_size=patch_size * num_windows``, or use
+            :func:`~rfdetr.utilities.tensors.make_collate_fn` with that value.
 
     Raises:
         ValueError: If ``image_set`` is not one of the recognised split names.
