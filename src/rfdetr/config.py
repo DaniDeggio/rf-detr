@@ -460,6 +460,7 @@ class TrainConfig(BaseModel):
     group_detr: int = 13
     ia_bce_loss: bool = True
     cls_loss_coef: float = 1.0
+    class_weights: Optional[List[float]] = None
     num_select: int = 300
     dataset_file: Literal["coco", "o365", "roboflow", "yolo"] = "roboflow"
     square_resize_div_64: bool = True

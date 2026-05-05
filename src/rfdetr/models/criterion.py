@@ -24,7 +24,7 @@ from rfdetr.utilities import box_ops
 from rfdetr.utilities.distributed import get_world_size, is_dist_avail_and_initialized
 
 
-def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2):
+def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2, class_weights=None):
     """
     Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
     Args:
@@ -37,6 +37,9 @@ def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: f
                 positive vs negative examples. Default = -1 (no weighting).
         gamma: Exponent of the modulating factor (1 - p_t) to
                balance easy vs hard examples.
+        class_weights: optional list/tensor of per-class weights. If provided,
+                       the loss is multiplied by the corresponding class weight
+                       for each class dimension.
     Returns:
         Loss tensor
     """
@@ -48,6 +51,15 @@ def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: f
     if alpha >= 0:
         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
         loss = alpha_t * loss
+
+    # Apply per-class weights if provided
+    if class_weights is not None:
+        class_weights_tensor = torch.tensor(
+            class_weights, dtype=loss.dtype, device=loss.device
+        )
+        # targets has shape (batch, num_queries, num_classes)
+        # Apply weight for each class: multiply by weight[class_idx] where targets[..., class_idx] == 1
+        loss = loss * class_weights_tensor.view(1, 1, -1)
 
     return loss.mean(1).sum() / num_boxes
 
@@ -143,6 +155,7 @@ class SetCriterion(nn.Module):
         use_position_supervised_loss=False,
         ia_bce_loss=False,
         mask_point_sample_ratio: int = 16,
+        class_weights=None,
     ):
         """Create the criterion.
         Parameters:
@@ -152,6 +165,7 @@ class SetCriterion(nn.Module):
             losses: list of all the losses to be applied. See get_loss for list of available losses.
             focal_alpha: alpha in Focal Loss
             group_detr: Number of groups to speed detr training. Default is 1.
+            class_weights: optional list of per-class weights for focal loss. Length must equal num_classes+1 (including background).
         """
         super().__init__()
         self.num_classes = num_classes
@@ -165,6 +179,7 @@ class SetCriterion(nn.Module):
         self.use_position_supervised_loss = use_position_supervised_loss
         self.ia_bce_loss = ia_bce_loss
         self.mask_point_sample_ratio = mask_point_sample_ratio
+        self.class_weights = class_weights
 
     def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
         """Classification loss (Binary focal loss)
@@ -301,6 +316,7 @@ class SetCriterion(nn.Module):
                     num_boxes,
                     alpha=self.focal_alpha,
                     gamma=2,
+                    class_weights=self.class_weights,
                 )
                 * src_logits.shape[1]
             )
